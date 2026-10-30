@@ -59,7 +59,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-logging.info("Starting AMR CLOUD...")
+logger = logging.getLogger("AMR_CLOUD")
+
+session = requests.Session()
+db_lock = threading.Lock()
+
+logger.info("Starting AMR CLOUD...")
 
 
 # =====================================================
@@ -97,6 +102,7 @@ def db_execute(query, params=None, fetchone=False, fetchall=False):
 
     except Exception:
         conn.rollback()
+        logger.exception("DATABASE QUERY FAILED")
         raise
 
     finally:
@@ -163,11 +169,11 @@ def init_db():
         """)
 
         conn.commit()
-        logging.info("Database initialized successfully.")
+        logger.info("Database initialized successfully.")
 
     except Exception:
         conn.rollback()
-        logging.exception("Database initialization failed")
+        logger.exception("Database initialization failed")
         raise
 
     finally:
@@ -178,9 +184,6 @@ def init_db():
 # =====================================================
 # TELEGRAM API
 # =====================================================
-
-session = requests.Session()
-
 
 def tg(method, data=None):
     try:
@@ -193,8 +196,8 @@ def tg(method, data=None):
         try:
             result = response.json()
         except ValueError:
-            logging.error(
-                "Invalid Telegram response [%s]: HTTP %s",
+            logger.error(
+                "TELEGRAM INVALID RESPONSE | method=%s | HTTP=%s",
                 method,
                 response.status_code
             )
@@ -204,8 +207,8 @@ def tg(method, data=None):
             }
 
         if not result.get("ok"):
-            logging.error(
-                "Telegram API error [%s]: HTTP %s | %s",
+            logger.error(
+                "TELEGRAM API FAILED | method=%s | HTTP=%s | description=%s",
                 method,
                 response.status_code,
                 result.get("description")
@@ -214,7 +217,7 @@ def tg(method, data=None):
         return result
 
     except requests.RequestException:
-        logging.exception("Telegram request failed: %s", method)
+        logger.exception("TELEGRAM REQUEST EXCEPTION | method=%s", method)
 
         return {
             "ok": False,
@@ -233,10 +236,18 @@ def send_message(chat_id, text, keyboard=None):
     if keyboard is not None:
         data["reply_markup"] = keyboard
 
+    logger.info("SEND MESSAGE START | chat=%s", chat_id)
+
     result = tg("sendMessage", data)
 
-    if not result.get("ok"):
-        logging.error(
+    if result.get("ok"):
+        logger.info(
+            "SEND MESSAGE SUCCESS | chat=%s | message_id=%s",
+            chat_id,
+            result.get("result", {}).get("message_id")
+        )
+    else:
+        logger.error(
             "SEND MESSAGE FAILED | chat=%s | error=%s",
             chat_id,
             result.get("description")
@@ -245,39 +256,34 @@ def send_message(chat_id, text, keyboard=None):
     return result
 
 
-def edit_message(chat_id, message_id, text, keyboard=None):
-    data = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": str(text),
-        "parse_mode": "HTML"
-    }
-
-    if keyboard is not None:
-        data["reply_markup"] = keyboard
-
-    return tg("editMessageText", data)
-
-
 def answer_callback(callback_id, text=""):
     if not callback_id:
+        logger.warning("CALLBACK ANSWER SKIPPED: callback ID missing")
         return {"ok": False}
 
-    return tg("answerCallbackQuery", {
+    result = tg("answerCallbackQuery", {
         "callback_query_id": callback_id,
         "text": str(text)[:200],
         "cache_time": 0
     })
 
+    if result.get("ok"):
+        logger.info("CALLBACK ACKNOWLEDGED")
+    else:
+        logger.error(
+            "CALLBACK ACK FAILED | %s",
+            result.get("description")
+        )
+
+    return result
+
 
 def keyboard(rows):
-    return {
-        "inline_keyboard": rows
-    }
+    return {"inline_keyboard": rows}
 
 
 # =====================================================
-# DATABASE SETTINGS
+# SETTINGS
 # =====================================================
 
 def get_setting(key, default=""):
@@ -311,6 +317,12 @@ def is_admin(user_id):
 
 
 def set_state(user_id, state):
+    logger.info(
+        "SET STATE START | user=%s | state=%s",
+        user_id,
+        state
+    )
+
     db_execute("""
         INSERT INTO admin_states(user_id,state)
         VALUES(%s,%s)
@@ -319,6 +331,12 @@ def set_state(user_id, state):
             state=EXCLUDED.state,
             updated_at=CURRENT_TIMESTAMP
     """, (user_id, state))
+
+    logger.info(
+        "SET STATE SUCCESS | user=%s | state=%s",
+        user_id,
+        state
+    )
 
 
 def get_state(user_id):
@@ -336,6 +354,8 @@ def clear_state(user_id):
         "DELETE FROM admin_states WHERE user_id=%s",
         (user_id,)
     )
+
+    logger.info("STATE CLEARED | user=%s", user_id)
 
 
 def admin_panel(chat_id):
@@ -367,9 +387,7 @@ def admin_panel(chat_id):
     )
 
     if result.get("ok"):
-        logging.info("ADMIN PANEL SENT | chat=%s", chat_id)
-    else:
-        logging.error("ADMIN PANEL FAILED: %s", result)
+        logger.info("ADMIN PANEL SENT | chat=%s", chat_id)
 
 
 # =====================================================
@@ -412,8 +430,8 @@ def check_force_join(user_id):
         })
 
         if not result.get("ok"):
-            logging.warning(
-                "FORCE JOIN CHECK FAILED | channel=%s | %s",
+            logger.warning(
+                "FORCE JOIN CHECK FAILED | channel=%s | error=%s",
                 channel["chat_id"],
                 result.get("description")
             )
@@ -550,8 +568,6 @@ def show_files(chat_id):
     send_message(chat_id, "<b>📁 RECENT UPLOADED FILES</b>")
 
     for file in files:
-        token = file["token"]
-
         send_message(
             chat_id,
             f"<b>{escape(file['file_name'] or 'Unnamed')}</b>\n"
@@ -560,7 +576,7 @@ def show_files(chat_id):
             keyboard([[
                 {
                     "text": "❌ Delete File",
-                    "callback_data": "delete_" + token
+                    "callback_data": "delete_" + file["token"]
                 }
             ]])
         )
@@ -742,7 +758,7 @@ def handle_message(message):
     user_id = user["id"]
     text = message.get("text", "")
 
-    logging.info(
+    logger.info(
         "MESSAGE RECEIVED | user=%s | chat=%s | text=%s",
         user_id,
         chat_id,
@@ -783,6 +799,12 @@ def handle_message(message):
 
     if is_admin(user_id):
         state = get_state(user_id)
+
+        logger.info(
+            "ADMIN MESSAGE STATE | user=%s | state=%s",
+            user_id,
+            state
+        )
 
         if state in ("startmsg", "starmsg"):
             if not text:
@@ -877,7 +899,7 @@ def handle_message(message):
 
 
 # =====================================================
-# CALLBACK HANDLER
+# CALLBACK HANDLER - REBUILT
 # =====================================================
 
 def handle_callback(callback):
@@ -888,156 +910,226 @@ def handle_callback(callback):
     message = callback.get("message") or {}
     chat_id = message.get("chat", {}).get("id")
 
-    logging.info(
+    logger.info(
         "CALLBACK RECEIVED | data=%s | user=%s | chat=%s",
         data,
         user_id,
         chat_id
     )
 
-    # Answer Telegram callback immediately.
+    # Telegram loading indicator is stopped immediately.
     answer_callback(callback_id)
 
     if not chat_id or not user_id:
-        logging.warning("Callback missing chat or user.")
+        logger.error("CALLBACK INVALID | missing chat_id or user_id")
         return
 
     if data == "verify":
-        missing = check_force_join(user_id)
+        try:
+            missing = check_force_join(user_id)
 
-        if missing:
-            send_message(chat_id, "❌ You have not joined all required channels.")
-        else:
-            send_message(chat_id, "✅ Verification successful. Send /start again.")
+            if missing:
+                send_message(
+                    chat_id,
+                    "❌ You have not joined all required channels."
+                )
+            else:
+                send_message(
+                    chat_id,
+                    "✅ Verification successful. Send /start again."
+                )
+
+        except Exception:
+            logger.exception("VERIFY CALLBACK FAILED")
+            send_message(chat_id, "⚠️ Verification failed. Please try again.")
+
         return
 
     if not is_admin(user_id):
-        logging.warning("Unauthorized callback | user=%s", user_id)
+        logger.warning("UNAUTHORIZED CALLBACK | user=%s", user_id)
         return
 
-    logging.info("ADMIN CALLBACK ACCEPTED | %s", data)
+    logger.info("ADMIN CALLBACK ACCEPTED | %s", data)
 
-    if data == "admin":
-        clear_state(user_id)
-        admin_panel(chat_id)
-        return
+    try:
 
-    if data == "upload":
-        set_state(user_id, "upload")
-        send_message(
-            chat_id,
-            "📤 <b>UPLOAD FILE</b>\n\nSend your file now.\n\nUse /cancel to cancel."
-        )
-        return
-
-    if data == "files":
-        show_files(chat_id)
-        return
-
-    if data.startswith("delete_"):
-        token = data[len("delete_"):]
-        deleted = delete_file(token)
-
-        send_message(
-            chat_id,
-            "✅ File deleted." if deleted else "❌ File not found."
-        )
-        return
-
-    if data == "startmsg":
-        set_state(user_id, "startmsg")
-        send_message(chat_id, "✏️ Send your new START message.\n\nUse /cancel to cancel.")
-        return
-
-    if data == "starmsg":
-        set_state(user_id, "starmsg")
-        send_message(chat_id, "⭐ Send your new STAR message.\n\nUse /cancel to cancel.")
-        return
-
-    if data == "channels":
-        send_message(
-            chat_id,
-            "<b>🔒 FORCE JOIN SETTINGS</b>",
-            keyboard([
-                [{"text": "➕ Add Channel", "callback_data": "addchannel"}],
-                [{"text": "📋 Channel List", "callback_data": "channellist"}],
-                [{"text": "❌ Remove Channel", "callback_data": "removechannel"}],
-                [{"text": "⬅️ Back", "callback_data": "admin"}]
-            ])
-        )
-        return
-
-    if data == "addchannel":
-        set_state(user_id, "addchannel")
-        send_message(
-            chat_id,
-            "Send channel username and invite link:\n\n"
-            "<code>@channelusername https://t.me/channel</code>\n\n"
-            "The bot must be an administrator in the channel."
-        )
-        return
-
-    if data == "channellist":
-        channels = get_channels()
-
-        if not channels:
-            send_message(chat_id, "No channels configured.")
+        if data == "admin":
+            clear_state(user_id)
+            admin_panel(chat_id)
             return
 
-        for channel in channels:
-            send_message(
+        # ---------------- UPLOAD ----------------
+
+        if data == "upload":
+            logger.info("UPLOAD CALLBACK START")
+
+            set_state(user_id, "upload")
+
+            logger.info("UPLOAD STATE SAVED")
+
+            result = send_message(
                 chat_id,
-                f"Channel ID: <code>{escape(channel['chat_id'])}</code>\n"
-                f"Link: {escape(channel['channel_link'])}"
+                "📤 <b>UPLOAD FILE</b>\n\n"
+                "Send your file now.\n\n"
+                "Use /cancel to cancel."
             )
-        return
 
-    if data == "removechannel":
-        channels = get_channels()
+            if result.get("ok"):
+                logger.info("UPLOAD PROMPT SENT SUCCESSFULLY")
+            else:
+                logger.error(
+                    "UPLOAD PROMPT FAILED | %s",
+                    result.get("description")
+                )
 
-        if not channels:
-            send_message(chat_id, "No channels configured.")
             return
 
-        for channel in channels:
-            channel_id = channel["chat_id"]
+        # ---------------- FILES ----------------
+
+        if data == "files":
+            show_files(chat_id)
+            return
+
+        if data.startswith("delete_"):
+            token = data[len("delete_"):]
+
+            if not token:
+                send_message(chat_id, "❌ Invalid file token.")
+                return
+
+            deleted = delete_file(token)
 
             send_message(
                 chat_id,
-                f"Channel: <code>{escape(channel_id)}</code>",
-                keyboard([[
-                    {
-                        "text": "❌ Remove",
-                        "callback_data": "rmch_" + channel_id
-                    }
-                ]])
+                "✅ File deleted." if deleted else "❌ File not found."
             )
-        return
+            return
 
-    if data.startswith("rmch_"):
-        channel_id = data[len("rmch_"):]
+        # ---------------- MESSAGES ----------------
 
-        db_execute(
-            "DELETE FROM channels WHERE chat_id=%s",
-            (channel_id,)
+        if data == "startmsg":
+            set_state(user_id, "startmsg")
+
+            send_message(
+                chat_id,
+                "✏️ Send your new START message.\n\nUse /cancel to cancel."
+            )
+            return
+
+        if data == "starmsg":
+            set_state(user_id, "starmsg")
+
+            send_message(
+                chat_id,
+                "⭐ Send your new STAR message.\n\nUse /cancel to cancel."
+            )
+            return
+
+        # ---------------- CHANNELS ----------------
+
+        if data == "channels":
+            send_message(
+                chat_id,
+                "<b>🔒 FORCE JOIN SETTINGS</b>",
+                keyboard([
+                    [{"text": "➕ Add Channel", "callback_data": "addchannel"}],
+                    [{"text": "📋 Channel List", "callback_data": "channellist"}],
+                    [{"text": "❌ Remove Channel", "callback_data": "removechannel"}],
+                    [{"text": "⬅️ Back", "callback_data": "admin"}]
+                ])
+            )
+            return
+
+        if data == "addchannel":
+            set_state(user_id, "addchannel")
+
+            send_message(
+                chat_id,
+                "Send channel username and invite link:\n\n"
+                "<code>@channelusername https://t.me/channel</code>\n\n"
+                "The bot must be an administrator in the channel."
+            )
+            return
+
+        if data == "channellist":
+            channels = get_channels()
+
+            if not channels:
+                send_message(chat_id, "No channels configured.")
+                return
+
+            for channel in channels:
+                send_message(
+                    chat_id,
+                    f"Channel ID: <code>{escape(channel['chat_id'])}</code>\n"
+                    f"Link: {escape(channel['channel_link'])}"
+                )
+            return
+
+        if data == "removechannel":
+            channels = get_channels()
+
+            if not channels:
+                send_message(chat_id, "No channels configured.")
+                return
+
+            for channel in channels:
+                channel_id = channel["chat_id"]
+
+                send_message(
+                    chat_id,
+                    f"Channel: <code>{escape(channel_id)}</code>",
+                    keyboard([[
+                        {
+                            "text": "❌ Remove",
+                            "callback_data": "rmch_" + channel_id
+                        }
+                    ]])
+                )
+            return
+
+        if data.startswith("rmch_"):
+            channel_id = data[len("rmch_"):]
+
+            db_execute(
+                "DELETE FROM channels WHERE chat_id=%s",
+                (channel_id,)
+            )
+
+            send_message(chat_id, "✅ Channel removed.")
+            return
+
+        # ---------------- STATUS ----------------
+
+        if data == "status":
+            show_status(chat_id)
+            return
+
+        # ---------------- BROADCAST ----------------
+
+        if data == "broadcast":
+            set_state(user_id, "broadcast")
+
+            send_message(
+                chat_id,
+                "📢 Send broadcast text.\n\nUse /cancel to cancel."
+            )
+            return
+
+        logger.warning("UNKNOWN CALLBACK DATA: %s", data)
+
+    except Exception:
+        logger.exception(
+            "CALLBACK ACTION FAILED | data=%s | user=%s",
+            data,
+            user_id
         )
 
-        send_message(chat_id, "✅ Channel removed.")
-        return
-
-    if data == "status":
-        show_status(chat_id)
-        return
-
-    if data == "broadcast":
-        set_state(user_id, "broadcast")
         send_message(
             chat_id,
-            "📢 Send broadcast text.\n\nUse /cancel to cancel."
+            "⚠️ Something went wrong while processing this button. "
+            "Please check Render logs."
         )
-        return
-
-    logging.warning("UNKNOWN CALLBACK DATA: %s", data)
 
 
 # =====================================================
@@ -1054,18 +1146,18 @@ def telegram_webhook():
         )
 
         if not hmac.compare_digest(supplied, WEBHOOK_SECRET):
-            logging.warning("WEBHOOK REJECTED: Invalid secret.")
+            logger.warning("WEBHOOK REJECTED: Invalid secret.")
             abort(403)
 
     update = request.get_json(silent=True)
 
     if not isinstance(update, dict):
-        logging.warning("WEBHOOK RECEIVED INVALID JSON")
+        logger.warning("WEBHOOK RECEIVED INVALID JSON")
         return jsonify({"ok": False, "error": "Invalid JSON"}), 400
 
     update_id = update.get("update_id")
 
-    logging.info(
+    logger.info(
         "WEBHOOK RECEIVED | update_id=%s | keys=%s",
         update_id,
         list(update.keys())
@@ -1073,7 +1165,6 @@ def telegram_webhook():
 
     try:
         if update_id is not None:
-            # Atomic duplicate check.
             claimed = db_execute("""
                 INSERT INTO processed_updates(update_id)
                 VALUES(%s)
@@ -1082,7 +1173,7 @@ def telegram_webhook():
             """, (update_id,), fetchone=True)
 
             if not claimed:
-                logging.info("DUPLICATE UPDATE IGNORED: %s", update_id)
+                logger.info("DUPLICATE UPDATE IGNORED: %s", update_id)
                 return jsonify({"ok": True, "duplicate": True})
 
         if "callback_query" in update:
@@ -1092,16 +1183,18 @@ def telegram_webhook():
             handle_message(update["message"])
 
         else:
-            logging.info("UNHANDLED UPDATE TYPE: %s", list(update.keys()))
+            logger.info(
+                "UNHANDLED UPDATE TYPE: %s",
+                list(update.keys())
+            )
 
-        logging.info("UPDATE PROCESSED SUCCESSFULLY: %s", update_id)
+        logger.info("UPDATE PROCESSED SUCCESSFULLY: %s", update_id)
 
         return jsonify({"ok": True})
 
     except Exception:
-        logging.exception("WEBHOOK PROCESSING FAILED: %s", update_id)
+        logger.exception("WEBHOOK PROCESSING FAILED: %s", update_id)
 
-        # Allow Telegram to retry a failed update.
         if update_id is not None:
             try:
                 db_execute(
@@ -1109,7 +1202,7 @@ def telegram_webhook():
                     (update_id,)
                 )
             except Exception:
-                logging.exception("Could not release failed update claim")
+                logger.exception("COULD NOT RELEASE UPDATE CLAIM")
 
         return jsonify({"ok": False}), 500
 
@@ -1176,7 +1269,7 @@ def health():
         })
 
     except Exception:
-        logging.exception("Health check failed")
+        logger.exception("HEALTH CHECK FAILED")
 
         return jsonify({
             "status": "error",
@@ -1348,7 +1441,7 @@ def download_file(token):
                     downloaded += len(chunk)
 
                     if downloaded > MAX_DOWNLOAD_SIZE:
-                        logging.warning("Download size limit exceeded")
+                        logger.warning("DOWNLOAD SIZE LIMIT EXCEEDED")
                         break
 
                     yield chunk
@@ -1371,7 +1464,7 @@ def download_file(token):
         )
 
     except Exception:
-        logging.exception("Download error")
+        logger.exception("DOWNLOAD ERROR")
         return "Download error.", 500
 
 
@@ -1403,10 +1496,7 @@ def setup_webhook():
 
     result = tg("setWebhook", webhook_data)
 
-    logging.info(
-        "WEBHOOK SETUP RESULT: %s",
-        result
-    )
+    logger.info("WEBHOOK SETUP RESULT: %s", result)
 
     return jsonify(result)
 
@@ -1423,7 +1513,7 @@ def webhook_info():
     if result.get("ok"):
         info = result.get("result", {})
 
-        logging.info(
+        logger.info(
             "WEBHOOK INFO | url=%s | pending=%s | last_error=%s",
             info.get("url"),
             info.get("pending_update_count"),
@@ -1457,7 +1547,7 @@ if not UPDATE_SECRET:
 
 init_db()
 
-logging.info("AMR CLOUD is ready.")
+logger.info("AMR CLOUD is ready.")
 
 
 # =====================================================
@@ -1468,4 +1558,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", "5000"))
-                )
+        )
