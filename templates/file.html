@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>{{ file_name }} | AMR Cloud</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #080b12;
+    color: white;
+    font-family: Arial, sans-serif;
+    padding: 20px;
+}
+
+.container {
+    max-width: 650px;
+    margin: 40px auto;
+}
+
+.logo {
+    text-align: center;
+    font-size: 30px;
+    font-weight: bold;
+    letter-spacing: 4px;
+}
+
+.logo span {
+    color: #829cff;
+}
+
+.ad {
+    min-height: 90px;
+    margin: 25px 0;
+    border: 1px dashed #424d66;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #8992a5;
+    font-size: 12px;
+}
+
+.card {
+    padding: 25px;
+    border-radius: 18px;
+    background: #111827;
+    border: 1px solid #26334a;
+}
+
+.filename {
+    font-size: 20px;
+    overflow-wrap: anywhere;
+}
+
+.info {
+    color: #a4adbd;
+    font-size: 14px;
+    margin: 15px 0;
+}
+
+.preview {
+    width: 100%;
+    max-height: 400px;
+    margin: 15px 0;
+    border-radius: 10px;
+    background: #05070b;
+}
+
+.download {
+    display: block;
+    text-align: center;
+    background: #6d8cff;
+    color: white;
+    padding: 17px;
+    border-radius: 10px;
+    text-decoration: none;
+    font-weight: bold;
+    margin-top: 20px;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <div class="logo">
+        AMR <span>CLOUD</span>
+    </div>
+
+    <div class="ad">
+        Advertisement
+    </div>
+
+    <div class="card">
+
+        <h2 class="filename">{{ file_name }}</h2>
+
+        <div class="info">
+            File size:
+            {{ "%.2f"|format(file_size / 1048576) }} MB
+        </div>
+
+        <div class="info">
+            Type: {{ mime_type }}
+        </div>
+
+        {% if mime_type.startswith('image/') %}
+        <img class="preview"
+        src="/download/{{ token }}?preview=1">
+        {% elif mime_type == 'application/pdf' %}
+        <iframe class="preview"
+        src="/download/{{ token }}?preview=1"
+        height="400"></iframe>
+        {% elif mime_type.startswith('video/') %}
+        <video class="preview" controls>
+        <source src="/download/{{ token }}?preview=1">
+        </video>
+        {% endif %}
+
+        <a class="download"
+        href="/download/{{ token }}">
+        DOWNLOAD FILE
+        </a>
+
+    </div>
+
+    <div class="ad">
+        Advertisement
+    </div>
+
+    <p style="text-align:center;color:#667085">
+        © 2026 AMR Cloud
+    </p>
+
+</div>
+
+</body>
+</html>
