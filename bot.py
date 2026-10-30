@@ -1,636 +1,970 @@
 import os
+import re
 import uuid
 import secrets
-import mimetypes
 import logging
+import mimetypes
+from functools import wraps
+
 import requests
 import psycopg2
-import html
-
-from urllib.parse import quote
+from psycopg2.extras import RealDictCursor
 
 from flask import (
-    Flask,
-    request,
-    jsonify,
-    render_template,
-    Response,
-    abort
+    Flask, request, jsonify, abort,
+    redirect, make_response, Response
 )
 
-from jinja2 import TemplateNotFound
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ================= CONFIG =================
 
-# ==================================================
-# AMR CLOUD CONFIGURATION
-# ==================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-app = Flask(__name__)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+UPDATE_SECRET = os.getenv("UPDATE_SECRET", "")
 
-logger = logging.getLogger("AMR-CLOUD")
-
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-BOT_USERNAME = os.getenv(
-    "BOT_USERNAME", ""
-).strip().lstrip("@")
-
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-except ValueError:
-    ADMIN_ID = 0
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", ""
-).strip()
-
-WEBHOOK_SECRET = os.getenv(
-    "WEBHOOK_SECRET", ""
-).strip()
-
-UPDATE_SECRET = os.getenv(
-    "UPDATE_SECRET", ""
-).strip()
-
-SITE_URL = os.getenv(
+BASE_URL = os.getenv(
     "RENDER_EXTERNAL_URL", ""
-).strip().rstrip("/")
-
+).rstrip("/")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024
+app = Flask(__name__)
 
-REQUEST_TIMEOUT = 30
+app.secret_key = os.getenv(
+    "FLASK_SECRET",
+    secrets.token_hex(32)
+)
 
+logging.basicConfig(level=logging.INFO)
 
-# ==================================================
-# DATABASE CONNECTION
-# ==================================================
+# Admin temporary states
+admin_states = {}
+
+# ================= DATABASE =================
 
 def db():
-
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing")
-
     return psycopg2.connect(
         DATABASE_URL,
+        cursor_factory=RealDictCursor,
         connect_timeout=10
     )
 
 
-# ==================================================
-# DATABASE INITIALIZATION
-# ==================================================
-
 def init_db():
 
-    con = db()
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            id SERIAL PRIMARY KEY,
+            token TEXT UNIQUE NOT NULL,
+            file_id TEXT NOT NULL,
+            file_name TEXT,
+            file_type TEXT,
+            file_size BIGINT DEFAULT 0,
+            mime_type TEXT,
+            views INTEGER DEFAULT 0,
+            downloads INTEGER DEFAULT 0,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            chat_id TEXT PRIMARY KEY,
+            channel_link TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS processed_updates (
+            update_id BIGINT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_setting(key, default=""):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT value FROM settings WHERE key=%s",
+        (key,)
+    )
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO settings(key,value)
+        VALUES(%s,%s)
+        ON CONFLICT(key)
+        DO UPDATE SET value=EXCLUDED.value
+    """, (key, value))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# ================= TELEGRAM API =================
+
+def tg(method, data=None, files=None):
 
     try:
 
-        with con:
-
-            with con.cursor() as cur:
-
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS files (
-
-                        id SERIAL PRIMARY KEY,
-
-                        token VARCHAR(64) UNIQUE NOT NULL,
-
-                        file_id TEXT NOT NULL,
-
-                        file_name TEXT NOT NULL,
-
-                        mime_type TEXT,
-
-                        file_size BIGINT DEFAULT 0,
-
-                        created_at TIMESTAMP
-                            DEFAULT CURRENT_TIMESTAMP,
-
-                        downloads INTEGER DEFAULT 0,
-
-                        views INTEGER DEFAULT 0
-
-                    )
-                """)
-
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS processed_updates (
-
-                        update_id BIGINT PRIMARY KEY,
-
-                        processed_at TIMESTAMP
-                            DEFAULT CURRENT_TIMESTAMP
-
-                    )
-                """)
-
-        logger.info(
-            "AMR CLOUD database initialized successfully"
+        r = requests.post(
+            f"{API}/{method}",
+            data=data,
+            files=files,
+            timeout=40
         )
 
-    finally:
+        return r.json()
 
-        con.close()
+    except Exception as e:
+
+        logging.exception("Telegram API error")
+        return {"ok": False, "description": str(e)}
 
 
-# ==================================================
-# TELEGRAM API
-# ==================================================
+def send_message(chat_id, text, keyboard=None):
 
-def telegram(method, data=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
 
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
+    if keyboard:
+        data["reply_markup"] = keyboard
 
-    response = requests.post(
-        f"{API}/{method}",
-        json=data or {},
-        timeout=REQUEST_TIMEOUT
+    return tg("sendMessage", data)
+
+
+def answer_callback(callback_id, text=""):
+
+    tg("answerCallbackQuery", {
+        "callback_query_id": callback_id,
+        "text": text
+    })
+
+
+def edit_message(chat_id, message_id, text, keyboard=None):
+
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+
+    if keyboard:
+        data["reply_markup"] = keyboard
+
+    return tg("editMessageText", data)
+
+
+def inline_keyboard(rows):
+
+    return {
+        "inline_keyboard": rows
+    }
+
+
+# ================= ADMIN =================
+
+def is_admin(user_id):
+
+    return int(user_id) == ADMIN_ID
+
+
+def admin_panel(chat_id):
+
+    keyboard = inline_keyboard([
+
+        [
+            {"text": "📤 Upload File", "callback_data": "upload"},
+            {"text": "📁 Uploaded Files", "callback_data": "files"}
+        ],
+
+        [
+            {"text": "✏️ Start Message", "callback_data": "startmsg"},
+            {"text": "⭐ Star Message", "callback_data": "starmsg"}
+        ],
+
+        [
+            {"text": "🔒 Force Join", "callback_data": "channels"},
+            {"text": "📊 Bot Status", "callback_data": "status"}
+        ],
+
+        [
+            {"text": "📢 Broadcast", "callback_data": "broadcast"}
+        ],
+
+        [
+            {"text": "🔄 Refresh", "callback_data": "admin"}
+        ]
+
+    ])
+
+    send_message(
+        chat_id,
+        "<b>⚡ AMR CLOUD ADMIN PANEL</b>\n\n"
+        "Choose an option below:",
+        keyboard
     )
 
-    response.raise_for_status()
 
-    result = response.json()
+# ================= USER DATABASE =================
 
-    if not result.get("ok"):
+def save_user(user):
 
-        raise RuntimeError(
-            result.get(
-                "description",
-                "Telegram API error"
-            )
-        )
+    conn = db()
+    cur = conn.cursor()
 
-    return result["result"]
+    cur.execute("""
+        INSERT INTO users(user_id,username,first_name)
+        VALUES(%s,%s,%s)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+        username=EXCLUDED.username,
+        first_name=EXCLUDED.first_name
+    """, (
+        user["id"],
+        user.get("username"),
+        user.get("first_name")
+    ))
 
-
-# ==================================================
-# SEND MESSAGE
-# ==================================================
-
-def send_message(chat_id, message):
-
-    return telegram(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": message,
-            "disable_web_page_preview": True
-        }
-    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-# ==================================================
-# WEBHOOK CONFIGURATION
-# ==================================================
+# ================= FORCE JOIN =================
 
-def configure_webhook():
+def check_force_join(user_id):
 
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN missing")
-        return False
+    conn = db()
+    cur = conn.cursor()
 
-    if not WEBHOOK_SECRET:
-        logger.error("WEBHOOK_SECRET missing")
-        return False
+    cur.execute("SELECT chat_id,channel_link FROM channels")
+    channels = cur.fetchall()
 
-    if not SITE_URL:
-        logger.error("RENDER_EXTERNAL_URL missing")
-        return False
+    cur.close()
+    conn.close()
 
-    webhook_url = SITE_URL + "/telegram-webhook"
+    missing = []
 
-    try:
+    for channel in channels:
 
-        result = telegram(
-            "setWebhook",
-            {
-                "url": webhook_url,
-                "secret_token": WEBHOOK_SECRET,
-                "allowed_updates": ["message"]
-            }
-        )
+        result = tg("getChatMember", {
+            "chat_id": channel["chat_id"],
+            "user_id": user_id
+        })
 
-        logger.info(
-            "Webhook configured successfully: %s",
-            result
-        )
+        if not result.get("ok"):
 
-        return True
+            missing.append(channel)
+            continue
 
-    except Exception:
+        status = result["result"]["status"]
 
-        logger.exception(
-            "Webhook configuration failed"
-        )
+        if status not in ["member", "administrator", "creator"]:
 
-        return False
+            missing.append(channel)
+
+    return missing
 
 
-# ==================================================
-# FILE DETECTION
-# ==================================================
+# ================= FILE MANAGEMENT =================
 
-def get_file_object(message):
+def get_media(message):
 
-    for key in (
+    media_types = [
         "document",
+        "photo",
         "video",
         "audio",
+        "voice",
         "animation",
-        "voice"
-    ):
+        "video_note"
+    ]
 
-        if key in message:
-            return message[key]
+    for media_type in media_types:
 
-    if "photo" in message:
+        if media_type in message:
 
-        return message["photo"][-1]
+            media = message[media_type]
+
+            if media_type == "photo":
+                media = media[-1]
+
+            return {
+                "file_id": media["file_id"],
+                "file_name": media.get(
+                    "file_name",
+                    f"{media_type}_{uuid.uuid4().hex[:8]}"
+                ),
+                "file_type": media_type,
+                "file_size": media.get("file_size", 0),
+                "mime_type": media.get(
+                    "mime_type",
+                    mimetypes.guess_type(
+                        media.get("file_name", "")
+                    )[0] or "application/octet-stream"
+                )
+            }
 
     return None
 
 
-# ==================================================
-# FILE STORAGE
-# ==================================================
+def save_file(media):
 
-def save_file(file_obj):
+    token = secrets.token_urlsafe(12)
 
-    file_id = file_obj["file_id"]
+    conn = db()
+    cur = conn.cursor()
 
-    file_name = file_obj.get("file_name")
-
-    mime = file_obj.get("mime_type", "")
-
-    if not file_name:
-
-        extension = (
-            mimetypes.guess_extension(mime) or ""
+    cur.execute("""
+        INSERT INTO files(
+            token,file_id,file_name,file_type,
+            file_size,mime_type
         )
+        VALUES(%s,%s,%s,%s,%s,%s)
+    """, (
+        token,
+        media["file_id"],
+        media["file_name"],
+        media["file_type"],
+        media["file_size"],
+        media["mime_type"]
+    ))
 
-        file_name = (
-            f"AMR_{uuid.uuid4().hex[:10]}{extension}"
-        )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    mime_type = (
+    return token
 
-        mime
-
-        or mimetypes.guess_type(file_name)[0]
-
-        or "application/octet-stream"
-
-    )
-
-    file_size = int(
-        file_obj.get("file_size") or 0
-    )
-
-    if file_size > MAX_DOWNLOAD_SIZE:
-
-        return None, (
-            "File exceeds the 20 MB limit "
-            "of the standard Telegram Bot API."
-        )
-
-    token = secrets.token_urlsafe(24)
-
-    con = db()
-
-    try:
-
-        with con:
-
-            with con.cursor() as cur:
-
-                cur.execute("""
-
-                    INSERT INTO files (
-
-                        token,
-                        file_id,
-                        file_name,
-                        mime_type,
-                        file_size
-
-                    )
-
-                    VALUES (%s, %s, %s, %s, %s)
-
-                """, (
-
-                    token,
-                    file_id,
-                    file_name,
-                    mime_type,
-                    file_size
-
-                ))
-
-    finally:
-
-        con.close()
-
-    return token, None
-
-
-# ==================================================
-# GET FILE
-# ==================================================
 
 def get_file(token):
 
-    con = db()
+    conn = db()
+    cur = conn.cursor()
 
-    try:
+    cur.execute(
+        "SELECT * FROM files WHERE token=%s",
+        (token,)
+    )
 
-        with con.cursor() as cur:
+    result = cur.fetchone()
 
-            cur.execute("""
+    cur.close()
+    conn.close()
 
-                SELECT
-
-                    token,
-                    file_id,
-                    file_name,
-                    mime_type,
-                    file_size,
-                    downloads,
-                    views
-
-                FROM files
-
-                WHERE token = %s
-
-            """, (token,))
-
-            return cur.fetchone()
-
-    finally:
-
-        con.close()
+    return result
 
 
-# ==================================================
-# DUPLICATE UPDATE PROTECTION
-# ==================================================
+def delete_file(token):
 
-def claim_update(update_id):
+    conn = db()
+    cur = conn.cursor()
 
-    con = db()
+    cur.execute(
+        "DELETE FROM files WHERE token=%s",
+        (token,)
+    )
 
-    try:
+    deleted = cur.rowcount
 
-        with con:
+    conn.commit()
+    cur.close()
+    conn.close()
 
-            with con.cursor() as cur:
-
-                cur.execute("""
-
-                    INSERT INTO processed_updates (
-                        update_id
-                    )
-
-                    VALUES (%s)
-
-                    ON CONFLICT (update_id)
-                    DO NOTHING
-
-                    RETURNING update_id
-
-                """, (update_id,))
-
-                return cur.fetchone() is not None
-
-    finally:
-
-        con.close()
+    return deleted
 
 
-def release_update(update_id):
+# ================= FILE LIST =================
 
-    con = db()
+def show_files(chat_id):
 
-    try:
+    conn = db()
+    cur = conn.cursor()
 
-        with con:
+    cur.execute("""
+        SELECT token,file_name,file_type
+        FROM files
+        ORDER BY id DESC
+        LIMIT 30
+    """)
 
-            with con.cursor() as cur:
+    files = cur.fetchall()
 
-                cur.execute("""
+    cur.close()
+    conn.close()
 
-                    DELETE FROM processed_updates
+    if not files:
 
-                    WHERE update_id = %s
+        send_message(chat_id, "No files uploaded yet.")
+        return
 
-                """, (update_id,))
+    for f in files:
 
-    finally:
+        keyboard = inline_keyboard([[
+            {
+                "text": "❌ Delete",
+                "callback_data": "delete_" + f["token"]
+            }
+        ]])
 
-        con.close()
+        send_message(
+            chat_id,
+            f"<b>{f['file_name']}</b>\n"
+            f"Type: {f['file_type']}\n"
+            f"Token: <code>{f['token']}</code>",
+            keyboard
+        )
 
 
-# ==================================================
-# START COMMAND
-# ==================================================
+# ================= STATUS =================
 
-def handle_start(chat_id, user_id, payload):
+def show_status(chat_id):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS n FROM users")
+    users = cur.fetchone()["n"]
+
+    cur.execute("SELECT COUNT(*) AS n FROM files")
+    files = cur.fetchone()["n"]
+
+    cur.execute("SELECT COALESCE(SUM(views),0) AS n FROM files")
+    views = cur.fetchone()["n"]
+
+    cur.execute("SELECT COALESCE(SUM(downloads),0) AS n FROM files")
+    downloads = cur.fetchone()["n"]
+
+    cur.close()
+    conn.close()
+
+    send_message(
+        chat_id,
+        "<b>📊 AMR CLOUD STATUS</b>\n\n"
+        f"👥 Users: {users}\n"
+        f"📁 Files: {files}\n"
+        f"👁 Views: {views}\n"
+        f"⬇️ Downloads: {downloads}"
+    )
+
+
+# ================= BROADCAST =================
+
+def broadcast(text):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT user_id FROM users")
+    users = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    sent = 0
+
+    for user in users:
+
+        result = send_message(
+            user["user_id"],
+            text
+        )
+
+        if result.get("ok"):
+            sent += 1
+
+    return sent
+
+
+# ================= START COMMAND =================
+
+def handle_start(message):
+
+    user = message["from"]
+    chat_id = message["chat"]["id"]
+
+    save_user(user)
+
+    text = message.get("text", "")
+    parts = text.split(maxsplit=1)
+
+    payload = parts[1] if len(parts) > 1 else ""
+
+    if is_admin(user["id"]) and not payload:
+
+        admin_panel(chat_id)
+        return
+
+    missing = check_force_join(user["id"])
+
+    if missing:
+
+        rows = []
+
+        for channel in missing:
+
+            rows.append([{
+                "text": "📢 Join Channel",
+                "url": channel["channel_link"]
+            }])
+
+        rows.append([{
+            "text": "✅ Joined - Verify",
+            "callback_data": "verify"
+        }])
+
+        send_message(
+            chat_id,
+            "🔒 <b>Join our required channels first.</b>",
+            inline_keyboard(rows)
+        )
+
+        return
 
     if payload.startswith("f_"):
 
         token = payload[2:]
 
-        result = get_file(token)
+        file = get_file(token)
 
-        if not result:
+        if not file:
+
+            send_message(chat_id, "❌ File not found.")
+            return
+
+        url = f"{BASE_URL}/file/{token}"
+
+        send_message(
+            chat_id,
+            "✅ File available!\n\n"
+            f"<b>{file['file_name']}</b>\n\n"
+            "Open the secure file page below:",
+            inline_keyboard([[
+                {
+                    "text": "🌐 OPEN FILE",
+                    "url": url
+                }
+            ]])
+        )
+
+        return
+
+    custom = get_setting(
+        "start_message",
+        "👋 Welcome to <b>AMR CLOUD</b>!\n\n"
+        "Send a file to access your download link."
+    )
+
+    send_message(chat_id, custom)
+
+
+# ================= WEBHOOK MESSAGE HANDLER =================
+
+def handle_message(message):
+
+    user = message.get("from", {})
+    chat_id = message["chat"]["id"]
+
+    if not user:
+        return
+
+    user_id = user["id"]
+
+    if message.get("text", "").startswith("/start"):
+
+        handle_start(message)
+        return
+
+    # Admin commands
+    if is_admin(user_id):
+
+        state = admin_states.get(user_id)
+
+        if state == "startmsg":
+
+            set_setting("start_message", message.get("text", ""))
+
+            admin_states.pop(user_id, None)
+
+            send_message(chat_id, "✅ Start message updated.")
+            return
+
+        if state == "starmsg":
+
+            set_setting("star_message", message.get("text", ""))
+
+            admin_states.pop(user_id, None)
+
+            send_message(chat_id, "✅ Star message updated.")
+            return
+
+        if state == "addchannel":
+
+            parts = message.get("text", "").split()
+
+            if len(parts) < 2:
+
+                send_message(
+                    chat_id,
+                    "Format:\n<code>@channelusername https://t.me/channel</code>"
+                )
+                return
+
+            channel_id = parts[0]
+            channel_link = parts[1]
+
+            conn = db()
+            cur = conn.cursor()
+
+            cur.execute("""
+                INSERT INTO channels(chat_id,channel_link)
+                VALUES(%s,%s)
+                ON CONFLICT(chat_id)
+                DO UPDATE SET channel_link=EXCLUDED.channel_link
+            """, (channel_id, channel_link))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            admin_states.pop(user_id, None)
+
+            send_message(chat_id, "✅ Channel configured.")
+            return
+
+        if state == "broadcast":
+
+            admin_states.pop(user_id, None)
+
+            sent = broadcast(message.get("text", ""))
 
             send_message(
                 chat_id,
-                "Sorry! This file does not exist."
+                f"✅ Broadcast completed.\nDelivered: {sent}"
+            )
+            return
+
+        media = get_media(message)
+
+        if state == "upload" and media:
+
+            token = save_file(media)
+
+            admin_states.pop(user_id, None)
+
+            link = (
+                f"https://t.me/{BOT_USERNAME}"
+                f"?start=f_{token}"
+            )
+
+            send_message(
+                chat_id,
+                "✅ <b>FILE UPLOADED</b>\n\n"
+                f"📁 {media['file_name']}\n"
+                f"📦 {media['file_size']} bytes\n\n"
+                f"<code>{link}</code>"
             )
 
             return
 
-        webpage = f"{SITE_URL}/file/{token}"
+    # Normal user file access is not allowed
+    if get_media(message):
 
         send_message(
-
             chat_id,
+            "Please use the file links provided by AMR CLOUD."
+        )
 
-            "YOUR FILE IS READY!\n\n"
 
-            "Your file is available below:\n\n"
+# ================= CALLBACK HANDLER =================
 
-            f"{webpage}"
+def handle_callback(callback):
 
+    data = callback["data"]
+    user_id = callback["from"]["id"]
+
+    message = callback["message"]
+    chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
+
+    answer_callback(callback["id"])
+
+    if data == "verify":
+
+        missing = check_force_join(user_id)
+
+        if missing:
+
+            send_message(
+                chat_id,
+                "❌ You have not joined all required channels."
+            )
+
+        else:
+
+            send_message(
+                chat_id,
+                "✅ Verification successful. Send /start again."
+            )
+
+        return
+
+    if not is_admin(user_id):
+        return
+
+    if data == "admin":
+
+        admin_panel(chat_id)
+        return
+
+    if data == "upload":
+
+        admin_states[user_id] = "upload"
+
+        send_message(
+            chat_id,
+            "📤 Send your file now."
         )
 
         return
 
-    if user_id == ADMIN_ID:
+    if data == "files":
+
+        show_files(chat_id)
+        return
+
+    if data.startswith("delete_"):
+
+        token = data.replace("delete_", "", 1)
+
+        deleted = delete_file(token)
+
+        if deleted:
+
+            send_message(chat_id, "✅ File deleted.")
+
+        else:
+
+            send_message(chat_id, "❌ File not found.")
+
+        return
+
+    if data == "startmsg":
+
+        admin_states[user_id] = "startmsg"
 
         send_message(
-
             chat_id,
-
-            "WELCOME TO AMR CLOUD ADMIN!\n\n"
-
-            "Send a file to upload.\n\n"
-
-            "ADMIN COMMANDS:\n\n"
-
-            "/stats - Statistics\n"
-
-            "/delete TOKEN - Delete file"
-
+            "Send your new START message."
         )
 
         return
 
-    send_message(
+    if data == "starmsg":
 
-        chat_id,
-
-        "WELCOME TO AMR CLOUD!\n\n"
-
-        "AMR CLOUD is an admin-managed file platform.\n\n"
-
-        "Open a valid file sharing link to access your file."
-
-    )
-
-
-# ==================================================
-# ADMIN STATISTICS
-# ==================================================
-
-def admin_stats(chat_id):
-
-    con = db()
-
-    try:
-
-        with con.cursor() as cur:
-
-            cur.execute("""
-
-                SELECT
-
-                    COUNT(*),
-
-                    COALESCE(SUM(downloads), 0),
-
-                    COALESCE(SUM(views), 0)
-
-                FROM files
-
-            """)
-
-            total, downloads, views = cur.fetchone()
-
-    finally:
-
-        con.close()
-
-    send_message(
-
-        chat_id,
-
-        "AMR CLOUD STATISTICS\n\n"
-
-        f"Total Files: {total}\n"
-
-        f"Total Views: {views}\n"
-
-        f"Total Downloads: {downloads}"
-
-    )
-
-
-# ==================================================
-# ADMIN DELETE
-# ==================================================
-
-def admin_delete(chat_id, token):
-
-    con = db()
-
-    try:
-
-        with con:
-
-            with con.cursor() as cur:
-
-                cur.execute("""
-
-                    DELETE FROM files
-
-                    WHERE token = %s
-
-                    RETURNING id
-
-                """, (token,))
-
-                deleted = cur.fetchone()
-
-    finally:
-
-        con.close()
-
-    if deleted:
+        admin_states[user_id] = "starmsg"
 
         send_message(
             chat_id,
-            "File deleted successfully."
+            "Send your new STAR message."
         )
 
-    else:
+        return
+
+    if data == "channels":
+
+        keyboard = inline_keyboard([
+
+            [{
+                "text": "➕ Add Force Join Channel",
+                "callback_data": "addchannel"
+            }],
+
+            [{
+                "text": "📋 Channel List",
+                "callback_data": "channellist"
+            }],
+
+            [{
+                "text": "❌ Remove Channel",
+                "callback_data": "removechannel"
+            }]
+
+        ])
 
         send_message(
             chat_id,
-            "File not found."
+            "🔒 <b>FORCE JOIN SETTINGS</b>",
+            keyboard
         )
 
+        return
 
-# ==================================================
-# TELEGRAM WEBHOOK
-# ==================================================
+    if data == "addchannel":
 
-@app.route(
-    "/telegram-webhook",
-    methods=["POST"]
-)
+        admin_states[user_id] = "addchannel"
 
-def webhook():
+        send_message(
+            chat_id,
+            "Send channel username and invite link:\n\n"
+            "<code>@channelusername https://t.me/channel</code>\n\n"
+            "Add the bot as an administrator in that channel."
+        )
 
-    incoming_secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token",
-        ""
+        return
+
+    if data == "channellist":
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM channels")
+        rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        if not rows:
+
+            send_message(chat_id, "No channels configured.")
+
+        else:
+
+            for channel in rows:
+
+                send_message(
+                    chat_id,
+                    f"{channel['chat_id']}\n"
+                    f"{channel['channel_link']}"
+                )
+
+        return
+
+    if data == "removechannel":
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM channels")
+        rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        for channel in rows:
+
+            send_message(
+                chat_id,
+                f"{channel['chat_id']}",
+                inline_keyboard([[
+                    {
+                        "text": "❌ Remove",
+                        "callback_data":
+                            "rmch_" + channel["chat_id"]
+                    }
+                ]])
+            )
+
+        return
+
+    if data.startswith("rmch_"):
+
+        channel_id = data.replace("rmch_", "", 1)
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute(
+            "DELETE FROM channels WHERE chat_id=%s",
+            (channel_id,)
+        )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        send_message(chat_id, "✅ Channel removed.")
+        return
+
+    if data == "status":
+
+        show_status(chat_id)
+        return
+
+    if data == "broadcast":
+
+        admin_states[user_id] = "broadcast"
+
+        send_message(
+            chat_id,
+            "📢 Send the broadcast text."
+        )
+
+        return
+
+
+# ================= WEBHOOK =================
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+
+    secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
     )
 
-    if not WEBHOOK_SECRET:
-
-        abort(403)
-
-    if not secrets.compare_digest(
-        incoming_secret,
-        WEBHOOK_SECRET
-    ):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
 
         abort(403)
 
@@ -638,668 +972,381 @@ def webhook():
 
     update_id = update.get("update_id")
 
-    message = update.get("message")
+    if update_id is not None:
 
-    if update_id is None or not message:
+        conn = db()
+        cur = conn.cursor()
 
-        return jsonify({"ok": True})
+        cur.execute("""
+            INSERT INTO processed_updates(update_id)
+            VALUES(%s)
+            ON CONFLICT DO NOTHING
+            RETURNING update_id
+        """, (update_id,))
 
-    # Atomically claim the update.
+        fresh = cur.fetchone()
 
-    if not claim_update(update_id):
+        conn.commit()
+        cur.close()
+        conn.close()
 
-        return jsonify({"ok": True})
+        if not fresh:
+            return jsonify({"ok": True})
 
     try:
 
-        chat_id = message["chat"]["id"]
+        if "message" in update:
 
-        user_id = message.get(
-            "from", {}
-        ).get("id")
+            handle_message(update["message"])
 
-        text = message.get("text", "").strip()
+        elif "callback_query" in update:
 
-        chat_type = message.get(
-            "chat", {}
-        ).get("type")
-
-        # PRIVATE CHAT ONLY
-
-        if chat_type != "private":
-
-            return jsonify({"ok": True})
-
-        # START COMMAND
-
-        if text.startswith("/start"):
-
-            parts = text.split(maxsplit=1)
-
-            payload = (
-                parts[1]
-                if len(parts) > 1
-                else ""
-            )
-
-            handle_start(
-                chat_id,
-                user_id,
-                payload
-            )
-
-            return jsonify({"ok": True})
-
-        # ADMIN SECURITY
-
-        if user_id != ADMIN_ID:
-
-            send_message(
-
-                chat_id,
-
-                "AMR CLOUD is an admin-managed platform."
-
-            )
-
-            return jsonify({"ok": True})
-
-        # STATS COMMAND
-
-        command = text.split(maxsplit=1)[0].split("@")[0] if text else ""
-
-        if command == "/stats":
-
-            admin_stats(chat_id)
-
-            return jsonify({"ok": True})
-
-        # DELETE COMMAND
-
-        if command == "/delete":
-
-            parts = text.split(maxsplit=1)
-
-            if len(parts) != 2:
-
-                send_message(
-                    chat_id,
-                    "Usage: /delete TOKEN"
-                )
-
-                return jsonify({"ok": True})
-
-            admin_delete(
-                chat_id,
-                parts[1].strip()
-            )
-
-            return jsonify({"ok": True})
-
-        # FILE UPLOAD
-
-        file_obj = get_file_object(message)
-
-        if file_obj:
-
-            token, error = save_file(file_obj)
-
-            if error:
-
-                send_message(
-                    chat_id,
-                    error
-                )
-
-            else:
-
-                if not BOT_USERNAME:
-
-                    raise RuntimeError(
-                        "BOT_USERNAME is missing"
-                    )
-
-                deep_link = (
-
-                    f"https://t.me/{BOT_USERNAME}"
-
-                    f"?start=f_{token}"
-
-                )
-
-                file_name = file_obj.get(
-                    "file_name",
-                    "Media File"
-                )
-
-                send_message(
-
-                    chat_id,
-
-                    "FILE UPLOADED SUCCESSFULLY!\n\n"
-
-                    f"File: {file_name}\n\n"
-
-                    "SHARE LINK:\n\n"
-
-                    f"{deep_link}\n\n"
-
-                    f"File ID: {token}\n\n"
-
-                    "Delete command:\n"
-
-                    f"/delete {token}"
-
-                )
-
-            return jsonify({"ok": True})
-
-        # UNKNOWN MESSAGE
-
-        send_message(
-
-            chat_id,
-
-            "AMR CLOUD ADMIN PANEL\n\n"
-
-            "Send a file to upload.\n\n"
-
-            "COMMANDS:\n"
-
-            "/start\n"
-
-            "/stats\n"
-
-            "/delete TOKEN"
-
-        )
-
-        return jsonify({"ok": True})
+            handle_callback(update["callback_query"])
 
     except Exception:
 
-        logger.exception(
-            "Webhook processing failed"
-        )
+        logging.exception("Update processing failed")
 
-        # Remove the claimed update so Telegram
-        # can retry after a failed operation.
-
-        try:
-
-            release_update(update_id)
-
-        except Exception:
-
-            logger.exception(
-                "Failed to release update"
-            )
-
-        abort(500)
+    return jsonify({"ok": True})
 
 
-# ==================================================
-# HOME PAGE
-# ==================================================
+# ================= WEBPAGE =================
+
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>AMR CLOUD</title>
+
+<style>
+
+*{
+box-sizing:border-box;
+}
+
+body{
+margin:0;
+background:#080b13;
+color:white;
+font-family:Arial,sans-serif;
+min-height:100vh;
+display:flex;
+align-items:center;
+justify-content:center;
+padding:20px;
+}
+
+.container{
+width:100%;
+max-width:480px;
+background:rgba(255,255,255,.055);
+border:1px solid rgba(255,255,255,.12);
+border-radius:25px;
+padding:28px;
+box-shadow:0 20px 80px rgba(0,0,0,.5);
+backdrop-filter:blur(20px);
+}
+
+.logo{
+font-size:27px;
+font-weight:bold;
+letter-spacing:2px;
+margin-bottom:25px;
+}
+
+.logo span{
+color:#7b83ff;
+}
+
+.file-icon{
+font-size:65px;
+margin-bottom:20px;
+}
+
+h2{
+font-size:22px;
+overflow-wrap:anywhere;
+}
+
+.info{
+color:#a7adbd;
+font-size:14px;
+line-height:1.8;
+margin-bottom:25px;
+}
+
+button{
+width:100%;
+border:0;
+padding:16px;
+border-radius:13px;
+font-size:15px;
+font-weight:bold;
+cursor:pointer;
+margin-top:12px;
+}
+
+.access{
+background:#716cff;
+color:white;
+}
+
+.download{
+background:#171e30;
+border:1px solid #555b78;
+color:white;
+}
+
+.note{
+font-size:12px;
+color:#8e95a8;
+text-align:center;
+margin-top:25px;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<div class="logo">AMR <span>CLOUD</span></div>
+
+<div class="file-icon">📁</div>
+
+<h2>{{NAME}}</h2>
+
+<div class="info">
+File Type: {{TYPE}}<br>
+File Size: {{SIZE}}<br>
+Secure File Sharing
+</div>
+
+<form action="/access/{{TOKEN}}" method="POST">
+<button class="access">
+🔓 ACCESS FILE
+</button>
+</form>
+
+<form action="/download/{{TOKEN}}" method="POST">
+<button class="download">
+⬇ DOWNLOAD FILE
+</button>
+</form>
+
+<div class="note">
+AMR CLOUD · Secure File Platform
+</div>
+
+</div>
+
+</body>
+</html>
+"""
+
+
+def format_size(size):
+
+    size = int(size or 0)
+
+    if size < 1024:
+        return f"{size} B"
+
+    if size < 1024**2:
+        return f"{size/1024:.2f} KB"
+
+    if size < 1024**3:
+        return f"{size/(1024**2):.2f} MB"
+
+    return f"{size/(1024**3):.2f} GB"
+
 
 @app.route("/")
-
 def home():
 
-    try:
+    return """
+    <h1>AMR CLOUD</h1>
+    <p>Secure File Sharing Platform</p>
+    <p>Service is running.</p>
+    """
 
-        return render_template("index.html")
-
-    except TemplateNotFound:
-
-        return Response("""
-
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta name="viewport"
-                  content="width=device-width, initial-scale=1">
-            <title>AMR CLOUD</title>
-            <style>
-                body {
-                    background: #101114;
-                    color: white;
-                    font-family: Arial;
-                    text-align: center;
-                    padding: 70px 15px;
-                }
-                .box {
-                    max-width: 450px;
-                    margin: auto;
-                    padding: 35px;
-                    background: #1b1d23;
-                    border-radius: 20px;
-                }
-                h1 { color: #8ab4ff; }
-                p { color: #aaa; }
-            </style>
-        </head>
-        <body>
-            <div class="box">
-                <h1>AMR CLOUD</h1>
-                <p>Your personal file sharing platform.</p>
-                <p>Secure. Simple. Accessible.</p>
-            </div>
-        </body>
-        </html>
-
-        """, content_type="text/html")
-
-
-# ==================================================
-# FILE WEBPAGE
-# ==================================================
-
-@app.route("/file/<token>")
-
-def file_page(token):
-
-    result = get_file(token)
-
-    if not result:
-
-        abort(404)
-
-    con = db()
-
-    try:
-
-        with con:
-
-            with con.cursor() as cur:
-
-                cur.execute("""
-
-                    UPDATE files
-
-                    SET views = views + 1
-
-                    WHERE token = %s
-
-                """, (token,))
-
-    finally:
-
-        con.close()
-
-    try:
-
-        return render_template(
-
-            "file.html",
-
-            token=result[0],
-
-            file_name=result[2],
-
-            mime_type=result[3],
-
-            file_size=result[4] or 0
-
-        )
-
-    except TemplateNotFound:
-
-        file_name = html.escape(result[2])
-
-        mime_type = html.escape(
-            result[3] or "application/octet-stream"
-        )
-
-        size = result[4] or 0
-
-        return Response(f"""
-
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta name="viewport"
-                  content="width=device-width, initial-scale=1">
-
-            <title>{file_name} - AMR CLOUD</title>
-
-            <style>
-                body {{
-                    background: #101114;
-                    color: white;
-                    font-family: Arial;
-                    padding: 30px 15px;
-                    text-align: center;
-                }}
-                .box {{
-                    max-width: 500px;
-                    margin: 50px auto;
-                    padding: 30px;
-                    background: #1b1d23;
-                    border-radius: 20px;
-                }}
-                a {{
-                    display: block;
-                    padding: 15px;
-                    margin: 15px 0;
-                    background: #4779d0;
-                    color: white;
-                    border-radius: 10px;
-                    text-decoration: none;
-                }}
-                .preview {{
-                    background: #333944;
-                }}
-            </style>
-        </head>
-
-        <body>
-
-            <div class="box">
-
-                <h1>AMR CLOUD</h1>
-
-                <h3>{file_name}</h3>
-
-                <p>File size: {size / 1024:.2f} KB</p>
-
-                <p>Type: {mime_type}</p>
-
-                <a class="preview"
-                   href="/download/{token}?preview=1">
-                   Preview File
-                </a>
-
-                <a href="/download/{token}">
-                   Download File
-                </a>
-
-            </div>
-
-        </body>
-        </html>
-
-        """, content_type="text/html")
-
-
-# ==================================================
-# FILE DOWNLOAD AND PREVIEW
-# ==================================================
-
-@app.route("/download/<token>")
-
-def download_file(token):
-
-    preview = (
-        request.args.get("preview") == "1"
-    )
-
-    result = get_file(token)
-
-    if not result:
-
-        abort(404)
-
-    file_id = result[1]
-
-    file_name = result[2]
-
-    mime_type = (
-        result[3] or "application/octet-stream"
-    )
-
-    file_size = result[4] or 0
-
-    if file_size > MAX_DOWNLOAD_SIZE:
-
-        abort(413)
-
-    # GET TELEGRAM FILE PATH
-
-    telegram_file = telegram(
-        "getFile",
-        {"file_id": file_id}
-    )
-
-    file_path = telegram_file["file_path"]
-
-    file_url = (
-
-        f"https://api.telegram.org/file/bot"
-
-        f"{BOT_TOKEN}/{file_path}"
-
-    )
-
-    upstream = requests.get(
-
-        file_url,
-
-        stream=True,
-
-        timeout=(10, 60)
-
-    )
-
-    if upstream.status_code != 200:
-
-        upstream.close()
-
-        abort(502)
-
-    # COUNT DOWNLOADS
-
-    if not preview:
-
-        con = db()
-
-        try:
-
-            with con:
-
-                with con.cursor() as cur:
-
-                    cur.execute("""
-
-                        UPDATE files
-
-                        SET downloads = downloads + 1
-
-                        WHERE token = %s
-
-                    """, (token,))
-
-        finally:
-
-            con.close()
-
-    # SAFE FILE NAME
-
-    safe_name = (
-
-        file_name
-
-        .replace("\r", "")
-
-        .replace("\n", "")
-
-        .replace('"', "'")
-
-    )
-
-    disposition = (
-        "inline" if preview else "attachment"
-    )
-
-    headers = {
-
-        "Content-Disposition":
-
-        f'{disposition}; filename="download"; '
-
-        f"filename*=UTF-8''{quote(safe_name)}",
-
-        "X-Content-Type-Options": "nosniff",
-
-        "Cache-Control": "private, no-store"
-
-    }
-
-    def generate():
-
-        try:
-
-            for chunk in upstream.iter_content(
-
-                chunk_size=64 * 1024
-
-            ):
-
-                if chunk:
-
-                    yield chunk
-
-        finally:
-
-            upstream.close()
-
-    return Response(
-
-        generate(),
-
-        content_type=mime_type,
-
-        headers=headers,
-
-        direct_passthrough=True
-
-    )
-
-
-# ==================================================
-# HEALTH CHECK
-# ==================================================
 
 @app.route("/health")
-
 def health():
+
+    return jsonify({
+        "status": "online",
+        "service": "AMR CLOUD"
+    })
+
+
+@app.route("/file/<token>")
+def file_page(token):
+
+    file = get_file(token)
+
+    if not file:
+        abort(404)
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "UPDATE files SET views=views+1 WHERE token=%s",
+        (token,)
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    html = HTML
+
+    html = html.replace("{{NAME}}", str(file["file_name"]))
+    html = html.replace("{{TYPE}}", str(file["file_type"]))
+    html = html.replace("{{SIZE}}", format_size(file["file_size"]))
+    html = html.replace("{{TOKEN}}", token)
+
+    return html
+
+
+# ================= ACCESS =================
+
+@app.route("/access/<token>", methods=["POST"])
+def access_file(token):
+
+    file = get_file(token)
+
+    if not file:
+        abort(404)
+
+    response = make_response(
+        redirect(f"/file/{token}")
+    )
+
+    response.set_cookie(
+        f"amr_access_{token}",
+        "authorized",
+        max_age=3600,
+        httponly=True,
+        secure=True,
+        samesite="Lax"
+    )
+
+    return response
+
+
+# ================= DOWNLOAD =================
+
+@app.route("/download/<token>", methods=["POST"])
+def download_file(token):
+
+    file = get_file(token)
+
+    if not file:
+        abort(404)
+
+    if request.cookies.get(
+        f"amr_access_{token}"
+    ) != "authorized":
+
+        return redirect(f"/file/{token}")
+
+    result = tg("getFile", {
+        "file_id": file["file_id"]
+    })
+
+    if not result.get("ok"):
+
+        return "Telegram file unavailable.", 502
+
+    file_path = result["result"]["file_path"]
+
+    download_url = (
+        f"https://api.telegram.org/file/bot"
+        f"{BOT_TOKEN}/{file_path}"
+    )
 
     try:
 
-        con = db()
+        r = requests.get(
+            download_url,
+            stream=True,
+            timeout=60
+        )
 
-        con.close()
+        if r.status_code != 200:
+            return "Download failed.", 502
 
-        return jsonify({
+        conn = db()
+        cur = conn.cursor()
 
-            "status": "online",
+        cur.execute(
+            "UPDATE files SET downloads=downloads+1 WHERE token=%s",
+            (token,)
+        )
 
-            "service": "AMR CLOUD",
+        conn.commit()
+        cur.close()
+        conn.close()
 
-            "database": "connected"
+        filename = re.sub(
+            r'[\r\n"\\\\]',
+            "_",
+            file["file_name"] or "download"
+        )
 
-        })
+        return Response(
+            r.iter_content(chunk_size=64 * 1024),
+            headers={
+                "Content-Type": file["mime_type"],
+                "Content-Disposition":
+                    f'attachment; filename="{filename}"'
+            }
+        )
 
     except Exception:
 
-        logger.exception(
-            "Health check failed"
-        )
-
-        return jsonify({
-
-            "status": "error",
-
-            "service": "AMR CLOUD",
-
-            "database": "disconnected"
-
-        }), 503
+        logging.exception("Download error")
+        return "Download error.", 500
 
 
-# ==================================================
-# MANUAL WEBHOOK SETUP
-# ==================================================
+# ================= WEBHOOK SETUP =================
 
 @app.route("/setup-webhook")
-
 def setup_webhook():
 
-    supplied_secret = request.args.get(
-        "secret", ""
-    )
+    secret = request.args.get("secret", "")
 
-    if not UPDATE_SECRET:
-
-        abort(403)
-
-    if not secrets.compare_digest(
-        supplied_secret,
-        UPDATE_SECRET
+    if not UPDATE_SECRET or not secrets.compare_digest(
+        secret, UPDATE_SECRET
     ):
 
         abort(403)
 
-    if configure_webhook():
+    webhook_url = f"{BASE_URL}/telegram-webhook"
 
-        return jsonify({
+    result = tg("setWebhook", {
+        "url": webhook_url,
+        "secret_token": WEBHOOK_SECRET,
+        "drop_pending_updates": True
+    })
 
-            "status": "success",
-
-            "message": "Webhook configured successfully"
-
-        })
-
-    return jsonify({
-
-        "status": "error",
-
-        "message": "Webhook configuration failed"
-
-    }), 500
+    return jsonify(result)
 
 
-# ==================================================
-# DATABASE STARTUP
-# ==================================================
+# ================= STARTUP =================
 
-try:
+init_db()
 
-    init_db()
-
-    logger.info(
-        "AMR CLOUD database ready"
-    )
-
-except Exception:
-
-    logger.exception(
-        "Database initialization failed"
-    )
-
-    raise
-
-
-# ==================================================
-# AUTOMATIC WEBHOOK SETUP
-# ==================================================
-
-# Gunicorn imports this module, so this section
-# executes during deployment startup.
-
-configure_webhook()
-
-
-# ==================================================
-# LOCAL DEVELOPMENT
-# ==================================================
+logging.info("AMR CLOUD database initialized.")
 
 if __name__ == "__main__":
 
     app.run(
-
         host="0.0.0.0",
-
-        port=int(os.getenv("PORT", 5000))
-
-        )
+        port=int(os.environ.get("PORT", 5000))
+    )
