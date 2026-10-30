@@ -1,9 +1,12 @@
 import os
 import re
 import uuid
+import time
+import html
 import secrets
 import logging
 import mimetypes
+import threading
 from functools import wraps
 
 import requests
@@ -20,13 +23,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ================= CONFIG =================
+# ==================================================
+# CONFIG
+# ==================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 UPDATE_SECRET = os.getenv("UPDATE_SECRET", "")
@@ -44,15 +49,22 @@ app.secret_key = os.getenv(
     secrets.token_hex(32)
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 admin_states = {}
 
+worker_lock = threading.Lock()
+worker_started = False
 
-# ================= DATABASE =================
+
+# ==================================================
+# DATABASE
+# ==================================================
 
 def db():
-
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is missing")
 
@@ -64,7 +76,6 @@ def db():
 
 
 def init_db():
-
     conn = db()
     cur = conn.cursor()
 
@@ -113,14 +124,38 @@ def init_db():
         )
     """)
 
-    conn.commit()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS auto_delete_queue (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            message_id BIGINT NOT NULL,
+            delete_at DOUBLE PRECISION NOT NULL,
+            UNIQUE(chat_id, message_id)
+        )
+    """)
 
+    cur.execute("""
+        INSERT INTO settings(key, value)
+        VALUES('auto_delete', 'on')
+        ON CONFLICT(key) DO NOTHING
+    """)
+
+    cur.execute("""
+        INSERT INTO settings(key, value)
+        VALUES('delete_seconds', '10')
+        ON CONFLICT(key) DO NOTHING
+    """)
+
+    conn.commit()
     cur.close()
     conn.close()
 
 
-def get_setting(key, default=""):
+# ==================================================
+# SETTINGS
+# ==================================================
 
+def get_setting(key, default=""):
     conn = db()
     cur = conn.cursor()
 
@@ -138,50 +173,174 @@ def get_setting(key, default=""):
 
 
 def set_setting(key, value):
-
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO settings(key,value)
-        VALUES(%s,%s)
+        INSERT INTO settings(key, value)
+        VALUES(%s, %s)
         ON CONFLICT(key)
         DO UPDATE SET value=EXCLUDED.value
-    """, (key, value))
+    """, (key, str(value)))
 
     conn.commit()
-
     cur.close()
     conn.close()
 
 
-# ================= TELEGRAM API =================
+def auto_delete_enabled():
+    return get_setting("auto_delete", "on") == "on"
 
-def tg(method, data=None, files=None):
+
+def delete_seconds():
+    try:
+        value = int(get_setting("delete_seconds", "10"))
+        return value if value in [5, 10, 30, 60] else 10
+    except Exception:
+        return 10
+
+
+# ==================================================
+# AUTO DELETE SYSTEM
+# ==================================================
+
+def schedule_delete(chat_id, message_id):
+    if not auto_delete_enabled():
+        return
 
     try:
+        seconds = delete_seconds()
 
-        r = requests.post(
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO auto_delete_queue(
+                chat_id,
+                message_id,
+                delete_at
+            )
+            VALUES(%s, %s, %s)
+            ON CONFLICT(chat_id, message_id)
+            DO UPDATE SET delete_at=EXCLUDED.delete_at
+        """, (
+            chat_id,
+            message_id,
+            time.time() + seconds
+        ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    except Exception:
+        logging.exception("Could not schedule message deletion")
+
+
+def delete_telegram_message(chat_id, message_id):
+    result = tg("deleteMessage", {
+        "chat_id": chat_id,
+        "message_id": message_id
+    })
+
+    if not result.get("ok"):
+        logging.warning(
+            "Message deletion failed: %s",
+            result.get("description")
+        )
+
+    return result.get("ok", False)
+
+
+def auto_delete_worker():
+    while True:
+        try:
+            conn = db()
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT id, chat_id, message_id
+                FROM auto_delete_queue
+                WHERE delete_at <= %s
+                ORDER BY delete_at ASC
+                LIMIT 50
+            """, (time.time(),))
+
+            rows = cur.fetchall()
+
+            for row in rows:
+                success = delete_telegram_message(
+                    row["chat_id"],
+                    row["message_id"]
+                )
+
+                # Remove expired task even if Telegram
+                # refuses deletion, to prevent infinite retries.
+                cur.execute(
+                    "DELETE FROM auto_delete_queue WHERE id=%s",
+                    (row["id"],)
+                )
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+        except Exception:
+            logging.exception("Auto-delete worker error")
+
+        time.sleep(2)
+
+
+def start_auto_delete_worker():
+    global worker_started
+
+    with worker_lock:
+        if worker_started:
+            return
+
+        thread = threading.Thread(
+            target=auto_delete_worker,
+            daemon=True
+        )
+
+        thread.start()
+        worker_started = True
+
+
+# ==================================================
+# TELEGRAM API
+# ==================================================
+
+def tg(method, data=None, files=None):
+    try:
+        response = requests.post(
             f"{API}/{method}",
             data=data,
             files=files,
             timeout=40
         )
 
-        return r.json()
+        result = response.json()
 
-    except Exception as e:
+        if not result.get("ok"):
+            logging.warning(
+                "Telegram API %s: %s",
+                method,
+                result.get("description")
+            )
 
-        logging.exception("Telegram API error")
+        return result
+
+    except Exception:
+        logging.exception("Telegram API request failed")
 
         return {
             "ok": False,
-            "description": str(e)
+            "description": "Telegram API request failed"
         }
 
 
 def send_message(chat_id, text, keyboard=None):
-
     data = {
         "chat_id": chat_id,
         "text": text,
@@ -191,19 +350,23 @@ def send_message(chat_id, text, keyboard=None):
     if keyboard:
         data["reply_markup"] = keyboard
 
-    return tg("sendMessage", data)
+    result = tg("sendMessage", data)
+
+    if result.get("ok"):
+        message_id = result["result"]["message_id"]
+        schedule_delete(chat_id, message_id)
+
+    return result
 
 
 def answer_callback(callback_id, text=""):
-
-    tg("answerCallbackQuery", {
+    return tg("answerCallbackQuery", {
         "callback_query_id": callback_id,
         "text": text
     })
 
 
 def edit_message(chat_id, message_id, text, keyboard=None):
-
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -218,94 +381,103 @@ def edit_message(chat_id, message_id, text, keyboard=None):
 
 
 def inline_keyboard(rows):
-
-    return {
-        "inline_keyboard": rows
-    }
+    return {"inline_keyboard": rows}
 
 
-# ================= ADMIN =================
+# ==================================================
+# ADMIN
+# ==================================================
 
 def is_admin(user_id):
-
     return int(user_id) == ADMIN_ID
 
 
 def admin_panel(chat_id):
-
     keyboard = inline_keyboard([
-
         [
-            {
-                "text": "📤 Upload File",
-                "callback_data": "upload"
-            },
-            {
-                "text": "📁 Uploaded Files",
-                "callback_data": "files"
-            }
+            {"text": "📤 Upload File", "callback_data": "upload"},
+            {"text": "📁 Uploaded Files", "callback_data": "files"}
         ],
-
         [
-            {
-                "text": "✏️ Start Message",
-                "callback_data": "startmsg"
-            },
-            {
-                "text": "⭐ Star Message",
-                "callback_data": "starmsg"
-            }
+            {"text": "✏️ Start Message", "callback_data": "startmsg"},
+            {"text": "⭐ Star Message", "callback_data": "starmsg"}
         ],
-
         [
-            {
-                "text": "🔒 Force Join",
-                "callback_data": "channels"
-            },
-            {
-                "text": "📊 Bot Status",
-                "callback_data": "status"
-            }
+            {"text": "🔒 Force Join", "callback_data": "channels"},
+            {"text": "📊 Bot Status", "callback_data": "status"}
         ],
-
         [
-            {
-                "text": "📢 Broadcast",
-                "callback_data": "broadcast"
-            }
+            {"text": "🗑 Auto Delete", "callback_data": "autodelete"}
         ],
-
         [
-            {
-                "text": "🔄 Refresh",
-                "callback_data": "admin"
-            }
+            {"text": "📢 Broadcast", "callback_data": "broadcast"}
+        ],
+        [
+            {"text": "🔄 Refresh", "callback_data": "admin"}
         ]
-
     ])
 
     send_message(
         chat_id,
-        "<b>⚡ AMR CLOUD ADMIN PANEL</b>\n\n"
-        "Choose an option below:",
+        "<b>⚡ AMR CLOUD ADMIN PANEL</b>\n\nChoose an option:",
         keyboard
     )
 
 
-# ================= USER DATABASE =================
+def auto_delete_panel(chat_id):
+    enabled = auto_delete_enabled()
+    seconds = delete_seconds()
+
+    keyboard = inline_keyboard([
+        [
+            {
+                "text": "🟢 ON" if enabled else "⚪ ON",
+                "callback_data": "autodel_on"
+            },
+            {
+                "text": "🔴 OFF" if not enabled else "⚪ OFF",
+                "callback_data": "autodel_off"
+            }
+        ],
+        [
+            {"text": "5 Seconds", "callback_data": "time_5"},
+            {"text": "10 Seconds", "callback_data": "time_10"}
+        ],
+        [
+            {"text": "30 Seconds", "callback_data": "time_30"},
+            {"text": "60 Seconds", "callback_data": "time_60"}
+        ],
+        [
+            {"text": "🔄 Refresh", "callback_data": "autodelete"},
+            {"text": "⬅️ Admin Panel", "callback_data": "admin"}
+        ]
+    ])
+
+    send_message(
+        chat_id,
+        "<b>🗑 AUTO DELETE SETTINGS</b>\n\n"
+        f"Status: {'ON 🟢' if enabled else 'OFF 🔴'}\n"
+        f"Delete time: {seconds} seconds\n\n"
+        "This setting applies to bot and user messages.",
+        keyboard
+    )
+
+
+# ==================================================
+# USER DATABASE
+# ==================================================
 
 def save_user(user):
-
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO users(user_id,username,first_name)
-        VALUES(%s,%s,%s)
+        INSERT INTO users(user_id, username, first_name)
+        VALUES(%s, %s, %s)
         ON CONFLICT(user_id)
         DO UPDATE SET
-        username=EXCLUDED.username,
-        first_name=EXCLUDED.first_name
+            username=EXCLUDED.username,
+            first_name=EXCLUDED.first_name
     """, (
         user["id"],
         user.get("username"),
@@ -313,20 +485,20 @@ def save_user(user):
     ))
 
     conn.commit()
-
     cur.close()
     conn.close()
 
 
-# ================= FORCE JOIN =================
+# ==================================================
+# FORCE JOIN
+# ==================================================
 
 def check_force_join(user_id):
-
     conn = db()
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT chat_id,channel_link FROM channels"
+        "SELECT chat_id, channel_link FROM channels"
     )
 
     channels = cur.fetchall()
@@ -337,14 +509,12 @@ def check_force_join(user_id):
     missing = []
 
     for channel in channels:
-
         result = tg("getChatMember", {
             "chat_id": channel["chat_id"],
             "user_id": user_id
         })
 
         if not result.get("ok"):
-
             missing.append(channel)
             continue
 
@@ -355,16 +525,16 @@ def check_force_join(user_id):
             "administrator",
             "creator"
         ]:
-
             missing.append(channel)
 
     return missing
 
 
-# ================= FILE MANAGEMENT =================
+# ==================================================
+# FILE MANAGEMENT
+# ==================================================
 
 def get_media(message):
-
     media_types = [
         "document",
         "photo",
@@ -376,41 +546,38 @@ def get_media(message):
     ]
 
     for media_type in media_types:
+        if media_type not in message:
+            continue
 
-        if media_type in message:
+        media = message[media_type]
 
-            media = message[media_type]
+        if media_type == "photo":
+            media = media[-1]
 
-            if media_type == "photo":
-                media = media[-1]
+        file_name = media.get("file_name") or (
+            f"{media_type}_{uuid.uuid4().hex[:8]}"
+        )
 
-            original_name = media.get("file_name")
+        mime_type = media.get("mime_type")
 
-            file_name = original_name or (
-                f"{media_type}_{uuid.uuid4().hex[:8]}"
+        if not mime_type:
+            mime_type = (
+                mimetypes.guess_type(file_name)[0]
+                or "application/octet-stream"
             )
 
-            mime_type = media.get("mime_type")
-
-            if not mime_type:
-                mime_type = (
-                    mimetypes.guess_type(file_name)[0]
-                    or "application/octet-stream"
-                )
-
-            return {
-                "file_id": media["file_id"],
-                "file_name": file_name,
-                "file_type": media_type,
-                "file_size": media.get("file_size", 0),
-                "mime_type": mime_type
-            }
+        return {
+            "file_id": media["file_id"],
+            "file_name": file_name,
+            "file_type": media_type,
+            "file_size": media.get("file_size", 0),
+            "mime_type": mime_type
+        }
 
     return None
 
 
 def save_file(media):
-
     token = secrets.token_urlsafe(12)
 
     conn = db()
@@ -418,14 +585,10 @@ def save_file(media):
 
     cur.execute("""
         INSERT INTO files(
-            token,
-            file_id,
-            file_name,
-            file_type,
-            file_size,
-            mime_type
+            token, file_id, file_name,
+            file_type, file_size, mime_type
         )
-        VALUES(%s,%s,%s,%s,%s,%s)
+        VALUES(%s, %s, %s, %s, %s, %s)
     """, (
         token,
         media["file_id"],
@@ -436,7 +599,6 @@ def save_file(media):
     ))
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -444,7 +606,6 @@ def save_file(media):
 
 
 def get_file(token):
-
     conn = db()
     cur = conn.cursor()
 
@@ -462,7 +623,6 @@ def get_file(token):
 
 
 def delete_file(token):
-
     conn = db()
     cur = conn.cursor()
 
@@ -474,22 +634,22 @@ def delete_file(token):
     deleted = cur.rowcount
 
     conn.commit()
-
     cur.close()
     conn.close()
 
     return deleted
 
 
-# ================= FILE LIST =================
+# ==================================================
+# FILE LIST
+# ==================================================
 
 def show_files(chat_id):
-
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT token,file_name,file_type
+        SELECT token, file_name, file_type
         FROM files
         ORDER BY id DESC
         LIMIT 30
@@ -501,56 +661,49 @@ def show_files(chat_id):
     conn.close()
 
     if not files:
-
-        send_message(
-            chat_id,
-            "No files uploaded yet."
-        )
-
+        send_message(chat_id, "No files uploaded yet.")
         return
 
-    for f in files:
+    for file in files:
+        name = html.escape(file["file_name"] or "Unnamed")
 
         keyboard = inline_keyboard([[
             {
                 "text": "❌ Delete",
-                "callback_data": "delete_" + f["token"]
+                "callback_data": "delete_" + file["token"]
             }
         ]])
 
         send_message(
             chat_id,
-            f"<b>{f['file_name']}</b>\n"
-            f"Type: {f['file_type']}\n"
-            f"Token: <code>{f['token']}</code>",
+            f"<b>{name}</b>\n"
+            f"Type: {file['file_type']}\n"
+            f"Token: <code>{file['token']}</code>",
             keyboard
         )
 
 
-# ================= STATUS =================
+# ==================================================
+# STATUS
+# ==================================================
 
 def show_status(chat_id):
-
     conn = db()
     cur = conn.cursor()
 
-    cur.execute(
-        "SELECT COUNT(*) AS n FROM users"
-    )
+    cur.execute("SELECT COUNT(*) AS n FROM users")
     users = cur.fetchone()["n"]
 
-    cur.execute(
-        "SELECT COUNT(*) AS n FROM files"
-    )
+    cur.execute("SELECT COUNT(*) AS n FROM files")
     files = cur.fetchone()["n"]
 
     cur.execute(
-        "SELECT COALESCE(SUM(views),0) AS n FROM files"
+        "SELECT COALESCE(SUM(views), 0) AS n FROM files"
     )
     views = cur.fetchone()["n"]
 
     cur.execute(
-        "SELECT COALESCE(SUM(downloads),0) AS n FROM files"
+        "SELECT COALESCE(SUM(downloads), 0) AS n FROM files"
     )
     downloads = cur.fetchone()["n"]
 
@@ -567,17 +720,15 @@ def show_status(chat_id):
     )
 
 
-# ================= BROADCAST =================
+# ==================================================
+# BROADCAST
+# ==================================================
 
 def broadcast(text):
-
     conn = db()
     cur = conn.cursor()
 
-    cur.execute(
-        "SELECT user_id FROM users"
-    )
-
+    cur.execute("SELECT user_id FROM users")
     users = cur.fetchall()
 
     cur.close()
@@ -586,22 +737,21 @@ def broadcast(text):
     sent = 0
 
     for user in users:
-
-        result = send_message(
-            user["user_id"],
-            text
-        )
+        result = send_message(user["user_id"], text)
 
         if result.get("ok"):
             sent += 1
 
+        time.sleep(0.05)
+
     return sent
 
 
-# ================= START COMMAND =================
+# ==================================================
+# START
+# ==================================================
 
 def handle_start(message):
-
     user = message["from"]
     chat_id = message["chat"]["id"]
 
@@ -613,18 +763,15 @@ def handle_start(message):
     payload = parts[1] if len(parts) > 1 else ""
 
     if is_admin(user["id"]) and not payload:
-
         admin_panel(chat_id)
         return
 
     missing = check_force_join(user["id"])
 
     if missing:
-
         rows = []
 
         for channel in missing:
-
             rows.append([{
                 "text": "📢 Join Channel",
                 "url": channel["channel_link"]
@@ -640,22 +787,19 @@ def handle_start(message):
             "🔒 <b>Join our required channels first.</b>",
             inline_keyboard(rows)
         )
-
         return
 
     if payload.startswith("f_"):
-
         token = payload[2:]
 
         file = get_file(token)
 
         if not file:
+            send_message(chat_id, "❌ File not found.")
+            return
 
-            send_message(
-                chat_id,
-                "❌ File not found."
-            )
-
+        if not BASE_URL:
+            send_message(chat_id, "❌ Website URL is not configured.")
             return
 
         url = f"{BASE_URL}/file/{token}"
@@ -663,16 +807,12 @@ def handle_start(message):
         send_message(
             chat_id,
             "✅ File available!\n\n"
-            f"<b>{file['file_name']}</b>\n\n"
+            f"<b>{html.escape(file['file_name'] or 'File')}</b>\n\n"
             "Open the secure file page below:",
             inline_keyboard([[
-                {
-                    "text": "🌐 OPEN FILE",
-                    "url": url
-                }
+                {"text": "🌐 OPEN FILE", "url": url}
             ]])
         )
-
         return
 
     custom = get_setting(
@@ -684,10 +824,11 @@ def handle_start(message):
     send_message(chat_id, custom)
 
 
-# ================= MESSAGE HANDLER =================
+# ==================================================
+# MESSAGE HANDLER
+# ==================================================
 
 def handle_message(message):
-
     user = message.get("from", {})
     chat_id = message["chat"]["id"]
 
@@ -696,59 +837,47 @@ def handle_message(message):
 
     user_id = user["id"]
 
-    if message.get("text", "").startswith("/start"):
+    try:
+        save_user(user)
+    except Exception:
+        logging.exception("Could not save user")
 
+    if message.get("text", "").startswith("/start"):
         handle_start(message)
         return
 
     if is_admin(user_id):
-
         state = admin_states.get(user_id)
 
         if state == "startmsg":
-
             set_setting(
                 "start_message",
                 message.get("text", "")
             )
 
             admin_states.pop(user_id, None)
-
-            send_message(
-                chat_id,
-                "✅ Start message updated."
-            )
-
+            send_message(chat_id, "✅ Start message updated.")
             return
 
         if state == "starmsg":
-
             set_setting(
                 "star_message",
                 message.get("text", "")
             )
 
             admin_states.pop(user_id, None)
-
-            send_message(
-                chat_id,
-                "✅ Star message updated."
-            )
-
+            send_message(chat_id, "✅ Star message updated.")
             return
 
         if state == "addchannel":
-
             parts = message.get("text", "").split()
 
             if len(parts) < 2:
-
                 send_message(
                     chat_id,
                     "Format:\n"
                     "<code>@channelusername https://t.me/channel</code>"
                 )
-
                 return
 
             channel_id = parts[0]
@@ -758,48 +887,34 @@ def handle_message(message):
             cur = conn.cursor()
 
             cur.execute("""
-                INSERT INTO channels(chat_id,channel_link)
-                VALUES(%s,%s)
+                INSERT INTO channels(chat_id, channel_link)
+                VALUES(%s, %s)
                 ON CONFLICT(chat_id)
                 DO UPDATE SET channel_link=EXCLUDED.channel_link
-            """, (
-                channel_id,
-                channel_link
-            ))
+            """, (channel_id, channel_link))
 
             conn.commit()
-
             cur.close()
             conn.close()
 
             admin_states.pop(user_id, None)
-
-            send_message(
-                chat_id,
-                "✅ Channel configured."
-            )
-
+            send_message(chat_id, "✅ Channel configured.")
             return
 
         if state == "broadcast":
-
             admin_states.pop(user_id, None)
 
-            sent = broadcast(
-                message.get("text", "")
-            )
+            sent = broadcast(message.get("text", ""))
 
             send_message(
                 chat_id,
                 f"✅ Broadcast completed.\nDelivered: {sent}"
             )
-
             return
 
         media = get_media(message)
 
         if state == "upload" and media:
-
             token = save_file(media)
 
             admin_states.pop(user_id, None)
@@ -812,25 +927,24 @@ def handle_message(message):
             send_message(
                 chat_id,
                 "✅ <b>FILE UPLOADED</b>\n\n"
-                f"📁 {media['file_name']}\n"
+                f"📁 {html.escape(media['file_name'])}\n"
                 f"📦 {media['file_size']} bytes\n\n"
                 f"<code>{link}</code>"
             )
-
             return
 
     if get_media(message):
-
         send_message(
             chat_id,
             "Please use the file links provided by AMR CLOUD."
         )
 
 
-# ================= CALLBACK HANDLER =================
+# ==================================================
+# CALLBACK HANDLER
+# ==================================================
 
 def handle_callback(callback):
-
     data = callback["data"]
     user_id = callback["from"]["id"]
 
@@ -840,18 +954,14 @@ def handle_callback(callback):
     answer_callback(callback["id"])
 
     if data == "verify":
-
         missing = check_force_join(user_id)
 
         if missing:
-
             send_message(
                 chat_id,
                 "❌ You have not joined all required channels."
             )
-
         else:
-
             send_message(
                 chat_id,
                 "✅ Verification successful. Send /start again."
@@ -863,89 +973,66 @@ def handle_callback(callback):
         return
 
     if data == "admin":
-
         admin_panel(chat_id)
         return
 
+    if data == "autodelete":
+        auto_delete_panel(chat_id)
+        return
+
+    if data == "autodel_on":
+        set_setting("auto_delete", "on")
+        auto_delete_panel(chat_id)
+        return
+
+    if data == "autodel_off":
+        set_setting("auto_delete", "off")
+        auto_delete_panel(chat_id)
+        return
+
+    if data.startswith("time_"):
+        seconds = data.replace("time_", "", 1)
+
+        if seconds in ["5", "10", "30", "60"]:
+            set_setting("delete_seconds", seconds)
+
+        auto_delete_panel(chat_id)
+        return
+
     if data == "upload":
-
         admin_states[user_id] = "upload"
-
-        send_message(
-            chat_id,
-            "📤 Send your file now."
-        )
-
+        send_message(chat_id, "📤 Send your file now.")
         return
 
     if data == "files":
-
         show_files(chat_id)
         return
 
     if data.startswith("delete_"):
-
         token = data.replace("delete_", "", 1)
-
         deleted = delete_file(token)
 
-        if deleted:
-
-            send_message(
-                chat_id,
-                "✅ File deleted."
-            )
-
-        else:
-
-            send_message(
-                chat_id,
-                "❌ File not found."
-            )
-
+        send_message(
+            chat_id,
+            "✅ File deleted." if deleted else "❌ File not found."
+        )
         return
 
     if data == "startmsg":
-
         admin_states[user_id] = "startmsg"
-
-        send_message(
-            chat_id,
-            "Send your new START message."
-        )
-
+        send_message(chat_id, "Send your new START message.")
         return
 
     if data == "starmsg":
-
         admin_states[user_id] = "starmsg"
-
-        send_message(
-            chat_id,
-            "Send your new STAR message."
-        )
-
+        send_message(chat_id, "Send your new STAR message.")
         return
 
     if data == "channels":
-
         keyboard = inline_keyboard([
-
-            [{
-                "text": "➕ Add Force Join Channel",
-                "callback_data": "addchannel"
-            }],
-
-            [{
-                "text": "📋 Channel List",
-                "callback_data": "channellist"
-            }],
-
-            [{
-                "text": "❌ Remove Channel",
-                "callback_data": "removechannel"
-            }]
-
+            [{"text": "➕ Add Channel", "callback_data": "addchannel"}],
+            [{"text": "📋 Channel List", "callback_data": "channellist"}],
+            [{"text": "❌ Remove Channel", "callback_data": "removechannel"}]
         ])
 
         send_message(
@@ -953,11 +1040,9 @@ def handle_callback(callback):
             "🔒 <b>FORCE JOIN SETTINGS</b>",
             keyboard
         )
-
         return
 
     if data == "addchannel":
-
         admin_states[user_id] = "addchannel"
 
         send_message(
@@ -966,66 +1051,48 @@ def handle_callback(callback):
             "<code>@channelusername https://t.me/channel</code>\n\n"
             "Add the bot as an administrator in that channel."
         )
-
         return
 
     if data == "channellist":
-
         conn = db()
         cur = conn.cursor()
 
-        cur.execute(
-            "SELECT * FROM channels"
-        )
-
+        cur.execute("SELECT * FROM channels")
         rows = cur.fetchall()
 
         cur.close()
         conn.close()
 
         if not rows:
-
-            send_message(
-                chat_id,
-                "No channels configured."
-            )
-
+            send_message(chat_id, "No channels configured.")
         else:
-
             for channel in rows:
-
                 send_message(
                     chat_id,
-                    f"{channel['chat_id']}\n"
-                    f"{channel['channel_link']}"
+                    f"{html.escape(channel['chat_id'])}\n"
+                    f"{html.escape(channel['channel_link'])}"
                 )
 
         return
 
     if data == "removechannel":
-
         conn = db()
         cur = conn.cursor()
 
-        cur.execute(
-            "SELECT * FROM channels"
-        )
-
+        cur.execute("SELECT * FROM channels")
         rows = cur.fetchall()
 
         cur.close()
         conn.close()
 
         for channel in rows:
-
             send_message(
                 chat_id,
-                f"{channel['chat_id']}",
+                html.escape(channel["chat_id"]),
                 inline_keyboard([[
                     {
                         "text": "❌ Remove",
-                        "callback_data":
-                            "rmch_" + channel["chat_id"]
+                        "callback_data": "rmch_" + channel["chat_id"]
                     }
                 ]])
             )
@@ -1033,10 +1100,7 @@ def handle_callback(callback):
         return
 
     if data.startswith("rmch_"):
-
-        channel_id = data.replace(
-            "rmch_", "", 1
-        )
+        channel_id = data.replace("rmch_", "", 1)
 
         conn = db()
         cur = conn.cursor()
@@ -1047,96 +1111,109 @@ def handle_callback(callback):
         )
 
         conn.commit()
-
         cur.close()
         conn.close()
 
-        send_message(
-            chat_id,
-            "✅ Channel removed."
-        )
-
+        send_message(chat_id, "✅ Channel removed.")
         return
 
     if data == "status":
-
         show_status(chat_id)
         return
 
     if data == "broadcast":
-
         admin_states[user_id] = "broadcast"
-
-        send_message(
-            chat_id,
-            "📢 Send the broadcast text."
-        )
-
+        send_message(chat_id, "📢 Send the broadcast text.")
         return
 
 
-# ================= WEBHOOK =================
+# ==================================================
+# WEBHOOK
+# ==================================================
 
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
-
     secret = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token",
         ""
     )
 
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+    if WEBHOOK_SECRET and not secrets.compare_digest(
+        secret,
+        WEBHOOK_SECRET
+    ):
         abort(403)
 
     update = request.get_json(silent=True) or {}
-
     update_id = update.get("update_id")
 
-    if update_id is not None:
-
-        conn = db()
-        cur = conn.cursor()
-
-        cur.execute("""
-            INSERT INTO processed_updates(update_id)
-            VALUES(%s)
-            ON CONFLICT DO NOTHING
-            RETURNING update_id
-        """, (update_id,))
-
-        fresh = cur.fetchone()
-
-        conn.commit()
-
-        cur.close()
-        conn.close()
-
-        if not fresh:
-            return jsonify({"ok": True})
-
     try:
+        # Claim update transactionally.
+        # If processing fails, remove the claim so Telegram can retry.
+        if update_id is not None:
+            conn = db()
+            cur = conn.cursor()
+
+            cur.execute("""
+                INSERT INTO processed_updates(update_id)
+                VALUES(%s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+            """, (update_id,))
+
+            fresh = cur.fetchone()
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            if not fresh:
+                return jsonify({"ok": True})
 
         if "message" in update:
+            message = update["message"]
 
-            handle_message(update["message"])
+            # Process first, then schedule deletion of user's message.
+            handle_message(message)
+
+            schedule_delete(
+                message["chat"]["id"],
+                message["message_id"]
+            )
 
         elif "callback_query" in update:
-
             handle_callback(update["callback_query"])
 
+        return jsonify({"ok": True})
+
     except Exception:
+        logging.exception("Webhook update processing failed")
 
-        logging.exception(
-            "Update processing failed"
-        )
+        if update_id is not None:
+            try:
+                conn = db()
+                cur = conn.cursor()
 
-    return jsonify({"ok": True})
+                cur.execute(
+                    "DELETE FROM processed_updates WHERE update_id=%s",
+                    (update_id,)
+                )
+
+                conn.commit()
+                cur.close()
+                conn.close()
+
+            except Exception:
+                logging.exception("Could not release update claim")
+
+        return jsonify({"ok": False}), 500
 
 
-# ================= FILE SIZE =================
+# ==================================================
+# FILE SIZE
+# ==================================================
 
 def format_size(size):
-
     size = int(size or 0)
 
     if size < 1024:
@@ -1151,11 +1228,12 @@ def format_size(size):
     return f"{size / (1024 ** 3):.2f} GB"
 
 
-# ================= HOME PAGE =================
+# ==================================================
+# HOME
+# ==================================================
 
 @app.route("/")
 def home():
-
     return """
     <h1>AMR CLOUD</h1>
     <p>Secure File Sharing Platform</p>
@@ -1163,22 +1241,20 @@ def home():
     """
 
 
-# ================= HEALTH =================
-
 @app.route("/health")
 def health():
-
     return jsonify({
         "status": "online",
         "service": "AMR CLOUD"
     })
 
 
-# ================= WEBPAGE =================
+# ==================================================
+# FILE PAGE
+# ==================================================
 
 @app.route("/file/<token>")
 def file_page(token):
-
     file = get_file(token)
 
     if not file:
@@ -1193,7 +1269,6 @@ def file_page(token):
     )
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -1201,18 +1276,17 @@ def file_page(token):
         "file.html",
         file={
             **file,
-            "formatted_size": format_size(
-                file["file_size"]
-            )
+            "formatted_size": format_size(file["file_size"])
         }
     )
 
 
-# ================= ACCESS =================
+# ==================================================
+# ACCESS
+# ==================================================
 
 @app.route("/access/<token>", methods=["POST"])
 def access_file(token):
-
     file = get_file(token)
 
     if not file:
@@ -1234,11 +1308,12 @@ def access_file(token):
     return response
 
 
-# ================= DOWNLOAD =================
+# ==================================================
+# DOWNLOAD
+# ==================================================
 
 @app.route("/download/<token>", methods=["POST"])
 def download_file(token):
-
     file = get_file(token)
 
     if not file:
@@ -1247,7 +1322,6 @@ def download_file(token):
     if request.cookies.get(
         f"amr_access_{token}"
     ) != "authorized":
-
         return redirect(f"/file/{token}")
 
     result = tg("getFile", {
@@ -1255,7 +1329,6 @@ def download_file(token):
     })
 
     if not result.get("ok"):
-
         return "Telegram file unavailable.", 502
 
     file_path = result["result"]["file_path"]
@@ -1266,7 +1339,6 @@ def download_file(token):
     )
 
     try:
-
         r = requests.get(
             download_url,
             stream=True,
@@ -1274,9 +1346,7 @@ def download_file(token):
         )
 
         if r.status_code != 200:
-
             r.close()
-
             return "Download failed.", 502
 
         filename = re.sub(
@@ -1294,26 +1364,20 @@ def download_file(token):
         )
 
         conn.commit()
-
         cur.close()
         conn.close()
 
         def generate():
-
             try:
-
                 for chunk in r.iter_content(
                     chunk_size=64 * 1024
                 ):
-
                     if chunk:
                         yield chunk
-
             finally:
-
                 r.close()
 
-        response = Response(
+        return Response(
             stream_with_context(generate()),
             content_type=(
                 file["mime_type"]
@@ -1325,31 +1389,23 @@ def download_file(token):
             }
         )
 
-        return response
-
     except Exception:
-
-        logging.exception(
-            "Download error"
-        )
-
+        logging.exception("Download error")
         return "Download error.", 500
 
 
-# ================= WEBHOOK SETUP =================
+# ==================================================
+# WEBHOOK SETUP
+# ==================================================
 
 @app.route("/setup-webhook")
 def setup_webhook():
-
-    secret = request.args.get(
-        "secret", ""
-    )
+    secret = request.args.get("secret", "")
 
     if not UPDATE_SECRET or not secrets.compare_digest(
         secret,
         UPDATE_SECRET
     ):
-
         abort(403)
 
     if not BASE_URL:
@@ -1358,33 +1414,31 @@ def setup_webhook():
             "error": "RENDER_EXTERNAL_URL is missing"
         }), 500
 
-    webhook_url = (
-        f"{BASE_URL}/telegram-webhook"
-    )
+    webhook_url = f"{BASE_URL}/telegram-webhook"
 
     result = tg("setWebhook", {
         "url": webhook_url,
         "secret_token": WEBHOOK_SECRET,
-        "drop_pending_updates": True
+        "drop_pending_updates": False
     })
 
     return jsonify(result)
 
 
-# ================= STARTUP =================
+# ==================================================
+# STARTUP
+# ==================================================
 
 init_db()
 
-logging.info(
-    "AMR CLOUD database initialized."
-)
+start_auto_delete_worker()
+
+logging.info("AMR CLOUD database initialized.")
+logging.info("Auto-delete worker started.")
 
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get("PORT", 5000)
+        port=int(os.environ.get("PORT", 5000))
         )
-                         )
