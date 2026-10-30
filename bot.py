@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import uuid
 import time
 import hmac
@@ -34,15 +33,17 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+except ValueError:
+    ADMIN_ID = 0
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 UPDATE_SECRET = os.getenv("UPDATE_SECRET", "").strip()
 
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-
 FLASK_SECRET = os.getenv("FLASK_SECRET") or secrets.token_hex(32)
 
 MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024
@@ -166,6 +167,7 @@ def init_db():
 
     except Exception:
         conn.rollback()
+        logging.exception("Database initialization failed")
         raise
 
     finally:
@@ -177,75 +179,105 @@ def init_db():
 # TELEGRAM API
 # =====================================================
 
+session = requests.Session()
+
+
 def tg(method, data=None):
     try:
-        response = requests.post(
+        response = session.post(
             f"{API}/{method}",
             json=data or {},
-            timeout=40
+            timeout=(10, 40)
         )
 
-        result = response.json()
+        try:
+            result = response.json()
+        except ValueError:
+            logging.error(
+                "Invalid Telegram response [%s]: HTTP %s",
+                method,
+                response.status_code
+            )
+            return {
+                "ok": False,
+                "description": "Invalid Telegram response"
+            }
 
         if not result.get("ok"):
             logging.error(
-                "Telegram API error [%s]: %s",
+                "Telegram API error [%s]: HTTP %s | %s",
                 method,
-                result
+                response.status_code,
+                result.get("description")
             )
 
         return result
 
-    except Exception:
-        logging.exception("Telegram API request failed: %s", method)
+    except requests.RequestException:
+        logging.exception("Telegram request failed: %s", method)
 
         return {
             "ok": False,
-            "description": "Telegram API request failed"
+            "description": "Telegram network request failed"
         }
 
 
 def send_message(chat_id, text, keyboard=None):
     data = {
         "chat_id": chat_id,
-        "text": text,
+        "text": str(text),
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
 
-    if keyboard:
+    if keyboard is not None:
         data["reply_markup"] = keyboard
 
-    return tg("sendMessage", data)
+    result = tg("sendMessage", data)
+
+    if not result.get("ok"):
+        logging.error(
+            "SEND MESSAGE FAILED | chat=%s | error=%s",
+            chat_id,
+            result.get("description")
+        )
+
+    return result
 
 
 def edit_message(chat_id, message_id, text, keyboard=None):
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text,
+        "text": str(text),
         "parse_mode": "HTML"
     }
 
-    if keyboard:
+    if keyboard is not None:
         data["reply_markup"] = keyboard
 
     return tg("editMessageText", data)
 
 
 def answer_callback(callback_id, text=""):
+    if not callback_id:
+        return {"ok": False}
+
     return tg("answerCallbackQuery", {
         "callback_query_id": callback_id,
-        "text": text
+        "text": str(text)[:200],
+        "cache_time": 0
     })
 
 
 def keyboard(rows):
-    return {"inline_keyboard": rows}
+    return {
+        "inline_keyboard": rows
+    }
 
 
 # =====================================================
-# SETTINGS
+# DATABASE SETTINGS
 # =====================================================
 
 def get_setting(key, default=""):
@@ -334,8 +366,10 @@ def admin_panel(chat_id):
         keyboard(rows)
     )
 
-    if not result.get("ok"):
-        logging.error("Admin panel send failed: %s", result)
+    if result.get("ok"):
+        logging.info("ADMIN PANEL SENT | chat=%s", chat_id)
+    else:
+        logging.error("ADMIN PANEL FAILED: %s", result)
 
 
 # =====================================================
@@ -379,9 +413,9 @@ def check_force_join(user_id):
 
         if not result.get("ok"):
             logging.warning(
-                "Force join check failed for %s: %s",
+                "FORCE JOIN CHECK FAILED | channel=%s | %s",
                 channel["chat_id"],
-                result
+                result.get("description")
             )
             missing.append(channel)
             continue
@@ -600,7 +634,7 @@ def broadcast(text):
 
 
 # =====================================================
-# START / HELP / STAR
+# START
 # =====================================================
 
 def handle_start(message):
@@ -708,6 +742,13 @@ def handle_message(message):
     user_id = user["id"]
     text = message.get("text", "")
 
+    logging.info(
+        "MESSAGE RECEIVED | user=%s | chat=%s | text=%s",
+        user_id,
+        chat_id,
+        text[:100]
+    )
+
     if text.startswith("/start"):
         handle_start(message)
         return
@@ -743,12 +784,13 @@ def handle_message(message):
     if is_admin(user_id):
         state = get_state(user_id)
 
-        if state == "startmsg" or state == "starmsg":
+        if state in ("startmsg", "starmsg"):
             if not text:
                 send_message(chat_id, "Please send a text message.")
                 return
 
             key = "start_message" if state == "startmsg" else "star_message"
+
             set_setting(key, text)
             clear_state(user_id)
 
@@ -847,17 +889,17 @@ def handle_callback(callback):
     chat_id = message.get("chat", {}).get("id")
 
     logging.info(
-        "BUTTON CLICKED: %s | USER: %s",
+        "CALLBACK RECEIVED | data=%s | user=%s | chat=%s",
         data,
-        user_id
+        user_id,
+        chat_id
     )
 
-    # Answer callback immediately
-    if callback_id:
-        answer_callback(callback_id)
+    # Answer Telegram callback immediately.
+    answer_callback(callback_id)
 
     if not chat_id or not user_id:
-        logging.warning("Callback has no chat or user.")
+        logging.warning("Callback missing chat or user.")
         return
 
     if data == "verify":
@@ -870,8 +912,10 @@ def handle_callback(callback):
         return
 
     if not is_admin(user_id):
-        logging.warning("Unauthorized callback from user %s", user_id)
+        logging.warning("Unauthorized callback | user=%s", user_id)
         return
+
+    logging.info("ADMIN CALLBACK ACCEPTED | %s", data)
 
     if data == "admin":
         clear_state(user_id)
@@ -993,7 +1037,7 @@ def handle_callback(callback):
         )
         return
 
-    logging.warning("Unknown callback data: %s", data)
+    logging.warning("UNKNOWN CALLBACK DATA: %s", data)
 
 
 # =====================================================
@@ -1010,46 +1054,63 @@ def telegram_webhook():
         )
 
         if not hmac.compare_digest(supplied, WEBHOOK_SECRET):
-            logging.warning("Invalid webhook secret.")
+            logging.warning("WEBHOOK REJECTED: Invalid secret.")
             abort(403)
 
-    update = request.get_json(silent=True) or {}
+    update = request.get_json(silent=True)
+
+    if not isinstance(update, dict):
+        logging.warning("WEBHOOK RECEIVED INVALID JSON")
+        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
+
     update_id = update.get("update_id")
+
+    logging.info(
+        "WEBHOOK RECEIVED | update_id=%s | keys=%s",
+        update_id,
+        list(update.keys())
+    )
 
     try:
         if update_id is not None:
-            # Check whether this update has already succeeded.
-            existing = db_execute(
-                "SELECT update_id FROM processed_updates WHERE update_id=%s",
-                (update_id,),
-                fetchone=True
-            )
-
-            if existing:
-                return jsonify({"ok": True, "duplicate": True})
-
-        if "message" in update:
-            handle_message(update["message"])
-
-        elif "callback_query" in update:
-            logging.info(
-                "WEBHOOK RECEIVED CALLBACK: %s",
-                update["callback_query"].get("data")
-            )
-            handle_callback(update["callback_query"])
-
-        # Mark only after successful processing.
-        if update_id is not None:
-            db_execute("""
+            # Atomic duplicate check.
+            claimed = db_execute("""
                 INSERT INTO processed_updates(update_id)
                 VALUES(%s)
                 ON CONFLICT DO NOTHING
-            """, (update_id,))
+                RETURNING update_id
+            """, (update_id,), fetchone=True)
+
+            if not claimed:
+                logging.info("DUPLICATE UPDATE IGNORED: %s", update_id)
+                return jsonify({"ok": True, "duplicate": True})
+
+        if "callback_query" in update:
+            handle_callback(update["callback_query"])
+
+        elif "message" in update:
+            handle_message(update["message"])
+
+        else:
+            logging.info("UNHANDLED UPDATE TYPE: %s", list(update.keys()))
+
+        logging.info("UPDATE PROCESSED SUCCESSFULLY: %s", update_id)
 
         return jsonify({"ok": True})
 
     except Exception:
-        logging.exception("Webhook update processing failed")
+        logging.exception("WEBHOOK PROCESSING FAILED: %s", update_id)
+
+        # Allow Telegram to retry a failed update.
+        if update_id is not None:
+            try:
+                db_execute(
+                    "DELETE FROM processed_updates WHERE update_id=%s",
+                    (update_id,)
+                )
+            except Exception:
+                logging.exception("Could not release failed update claim")
+
         return jsonify({"ok": False}), 500
 
 
@@ -1264,7 +1325,7 @@ def download_file(token):
     download_url = f"{FILE_API}/{file_path}"
 
     try:
-        r = requests.get(
+        r = session.get(
             download_url,
             stream=True,
             timeout=(15, 60)
@@ -1287,7 +1348,8 @@ def download_file(token):
                     downloaded += len(chunk)
 
                     if downloaded > MAX_DOWNLOAD_SIZE:
-                        raise RuntimeError("Download size limit exceeded")
+                        logging.warning("Download size limit exceeded")
+                        break
 
                     yield chunk
 
@@ -1325,7 +1387,10 @@ def setup_webhook():
         abort(403)
 
     if not BASE_URL:
-        return jsonify({"ok": False, "error": "RENDER_EXTERNAL_URL missing"}), 500
+        return jsonify({
+            "ok": False,
+            "error": "RENDER_EXTERNAL_URL missing"
+        }), 500
 
     webhook_data = {
         "url": f"{BASE_URL}/telegram-webhook",
@@ -1336,7 +1401,14 @@ def setup_webhook():
     if WEBHOOK_SECRET:
         webhook_data["secret_token"] = WEBHOOK_SECRET
 
-    return jsonify(tg("setWebhook", webhook_data))
+    result = tg("setWebhook", webhook_data)
+
+    logging.info(
+        "WEBHOOK SETUP RESULT: %s",
+        result
+    )
+
+    return jsonify(result)
 
 
 @app.route("/webhook-info")
@@ -1346,7 +1418,19 @@ def webhook_info():
     if not UPDATE_SECRET or not secrets.compare_digest(secret, UPDATE_SECRET):
         abort(403)
 
-    return jsonify(tg("getWebhookInfo"))
+    result = tg("getWebhookInfo")
+
+    if result.get("ok"):
+        info = result.get("result", {})
+
+        logging.info(
+            "WEBHOOK INFO | url=%s | pending=%s | last_error=%s",
+            info.get("url"),
+            info.get("pending_update_count"),
+            info.get("last_error_message")
+        )
+
+    return jsonify(result)
 
 
 # =====================================================
@@ -1368,6 +1452,9 @@ if not BASE_URL:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL missing")
 
+if not UPDATE_SECRET:
+    raise RuntimeError("UPDATE_SECRET missing")
+
 init_db()
 
 logging.info("AMR CLOUD is ready.")
@@ -1381,4 +1468,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", "5000"))
-            )
+                )
