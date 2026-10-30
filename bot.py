@@ -1,22 +1,22 @@
 import os
 import re
 import uuid
-import time
-import html
 import secrets
 import logging
 import mimetypes
 import threading
+from html import escape
 from functools import wraps
 
 import requests
 import psycopg2
+
 from psycopg2.extras import RealDictCursor
 
 from flask import (
     Flask, request, jsonify, abort,
     redirect, make_response, Response,
-    render_template, stream_with_context
+    render_template_string, stream_with_context
 )
 
 from dotenv import load_dotenv
@@ -24,11 +24,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================================================
-# CONFIG
+# CONFIGURATION
 # ==================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").replace("@", "")
+
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -55,27 +56,26 @@ logging.basicConfig(
 )
 
 admin_states = {}
-
-worker_lock = threading.Lock()
-worker_started = False
-
+state_lock = threading.Lock()
 
 # ==================================================
 # DATABASE
 # ==================================================
 
 def db():
+
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing")
+        raise RuntimeError("DATABASE_URL missing")
 
     return psycopg2.connect(
         DATABASE_URL,
         cursor_factory=RealDictCursor,
-        connect_timeout=10
+        connect_timeout=15
     )
 
 
 def init_db():
+
     conn = db()
     cur = conn.cursor()
 
@@ -124,38 +124,16 @@ def init_db():
         )
     """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS auto_delete_queue (
-            id SERIAL PRIMARY KEY,
-            chat_id BIGINT NOT NULL,
-            message_id BIGINT NOT NULL,
-            delete_at DOUBLE PRECISION NOT NULL,
-            UNIQUE(chat_id, message_id)
-        )
-    """)
-
-    cur.execute("""
-        INSERT INTO settings(key, value)
-        VALUES('auto_delete', 'on')
-        ON CONFLICT(key) DO NOTHING
-    """)
-
-    cur.execute("""
-        INSERT INTO settings(key, value)
-        VALUES('delete_seconds', '10')
-        ON CONFLICT(key) DO NOTHING
-    """)
-
     conn.commit()
+
     cur.close()
     conn.close()
 
+    logging.info("AMR CLOUD database initialized.")
 
-# ==================================================
-# SETTINGS
-# ==================================================
 
 def get_setting(key, default=""):
+
     conn = db()
     cur = conn.cursor()
 
@@ -173,193 +151,71 @@ def get_setting(key, default=""):
 
 
 def set_setting(key, value):
+
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO settings(key, value)
-        VALUES(%s, %s)
+        INSERT INTO settings(key,value)
+        VALUES(%s,%s)
         ON CONFLICT(key)
         DO UPDATE SET value=EXCLUDED.value
-    """, (key, str(value)))
+    """, (key, value))
 
     conn.commit()
+
     cur.close()
     conn.close()
-
-
-def auto_delete_enabled():
-    return get_setting("auto_delete", "on") == "on"
-
-
-def delete_seconds():
-    try:
-        value = int(get_setting("delete_seconds", "10"))
-        return value if value in [5, 10, 30, 60] else 10
-    except Exception:
-        return 10
-
-
-# ==================================================
-# AUTO DELETE SYSTEM
-# ==================================================
-
-def schedule_delete(chat_id, message_id):
-    if not auto_delete_enabled():
-        return
-
-    try:
-        seconds = delete_seconds()
-
-        conn = db()
-        cur = conn.cursor()
-
-        cur.execute("""
-            INSERT INTO auto_delete_queue(
-                chat_id,
-                message_id,
-                delete_at
-            )
-            VALUES(%s, %s, %s)
-            ON CONFLICT(chat_id, message_id)
-            DO UPDATE SET delete_at=EXCLUDED.delete_at
-        """, (
-            chat_id,
-            message_id,
-            time.time() + seconds
-        ))
-
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    except Exception:
-        logging.exception("Could not schedule message deletion")
-
-
-def delete_telegram_message(chat_id, message_id):
-    result = tg("deleteMessage", {
-        "chat_id": chat_id,
-        "message_id": message_id
-    })
-
-    if not result.get("ok"):
-        logging.warning(
-            "Message deletion failed: %s",
-            result.get("description")
-        )
-
-    return result.get("ok", False)
-
-
-def auto_delete_worker():
-    while True:
-        try:
-            conn = db()
-            cur = conn.cursor()
-
-            cur.execute("""
-                SELECT id, chat_id, message_id
-                FROM auto_delete_queue
-                WHERE delete_at <= %s
-                ORDER BY delete_at ASC
-                LIMIT 50
-            """, (time.time(),))
-
-            rows = cur.fetchall()
-
-            for row in rows:
-                success = delete_telegram_message(
-                    row["chat_id"],
-                    row["message_id"]
-                )
-
-                # Remove expired task even if Telegram
-                # refuses deletion, to prevent infinite retries.
-                cur.execute(
-                    "DELETE FROM auto_delete_queue WHERE id=%s",
-                    (row["id"],)
-                )
-
-            conn.commit()
-            cur.close()
-            conn.close()
-
-        except Exception:
-            logging.exception("Auto-delete worker error")
-
-        time.sleep(2)
-
-
-def start_auto_delete_worker():
-    global worker_started
-
-    with worker_lock:
-        if worker_started:
-            return
-
-        thread = threading.Thread(
-            target=auto_delete_worker,
-            daemon=True
-        )
-
-        thread.start()
-        worker_started = True
 
 
 # ==================================================
 # TELEGRAM API
 # ==================================================
 
-def tg(method, data=None, files=None):
+def tg(method, data=None):
+
     try:
+
         response = requests.post(
             f"{API}/{method}",
-            data=data,
-            files=files,
+            json=data or {},
             timeout=40
         )
 
         result = response.json()
 
         if not result.get("ok"):
-            logging.warning(
-                "Telegram API %s: %s",
-                method,
+            logging.error(
+                "Telegram API error: %s",
                 result.get("description")
             )
 
         return result
 
     except Exception:
+
         logging.exception("Telegram API request failed")
 
-        return {
-            "ok": False,
-            "description": "Telegram API request failed"
-        }
+        return {"ok": False}
 
 
 def send_message(chat_id, text, keyboard=None):
+
     data = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
 
     if keyboard:
         data["reply_markup"] = keyboard
 
-    result = tg("sendMessage", data)
-
-    if result.get("ok"):
-        message_id = result["result"]["message_id"]
-        schedule_delete(chat_id, message_id)
-
-    return result
+    return tg("sendMessage", data)
 
 
 def answer_callback(callback_id, text=""):
+
     return tg("answerCallbackQuery", {
         "callback_query_id": callback_id,
         "text": text
@@ -367,6 +223,7 @@ def answer_callback(callback_id, text=""):
 
 
 def edit_message(chat_id, message_id, text, keyboard=None):
+
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -381,6 +238,7 @@ def edit_message(chat_id, message_id, text, keyboard=None):
 
 
 def inline_keyboard(rows):
+
     return {"inline_keyboard": rows}
 
 
@@ -389,91 +247,77 @@ def inline_keyboard(rows):
 # ==================================================
 
 def is_admin(user_id):
-    return int(user_id) == ADMIN_ID
+
+    return int(user_id) == ADMIN_ID and ADMIN_ID != 0
+
+
+def set_state(user_id, state):
+
+    with state_lock:
+        admin_states[user_id] = state
+
+
+def get_state(user_id):
+
+    with state_lock:
+        return admin_states.get(user_id)
+
+
+def clear_state(user_id):
+
+    with state_lock:
+        admin_states.pop(user_id, None)
 
 
 def admin_panel(chat_id):
+
     keyboard = inline_keyboard([
+
         [
             {"text": "📤 Upload File", "callback_data": "upload"},
             {"text": "📁 Uploaded Files", "callback_data": "files"}
         ],
+
         [
             {"text": "✏️ Start Message", "callback_data": "startmsg"},
             {"text": "⭐ Star Message", "callback_data": "starmsg"}
         ],
+
         [
             {"text": "🔒 Force Join", "callback_data": "channels"},
             {"text": "📊 Bot Status", "callback_data": "status"}
         ],
-        [
-            {"text": "🗑 Auto Delete", "callback_data": "autodelete"}
-        ],
+
         [
             {"text": "📢 Broadcast", "callback_data": "broadcast"}
         ],
+
         [
             {"text": "🔄 Refresh", "callback_data": "admin"}
         ]
+
     ])
 
     send_message(
         chat_id,
-        "<b>⚡ AMR CLOUD ADMIN PANEL</b>\n\nChoose an option:",
-        keyboard
-    )
-
-
-def auto_delete_panel(chat_id):
-    enabled = auto_delete_enabled()
-    seconds = delete_seconds()
-
-    keyboard = inline_keyboard([
-        [
-            {
-                "text": "🟢 ON" if enabled else "⚪ ON",
-                "callback_data": "autodel_on"
-            },
-            {
-                "text": "🔴 OFF" if not enabled else "⚪ OFF",
-                "callback_data": "autodel_off"
-            }
-        ],
-        [
-            {"text": "5 Seconds", "callback_data": "time_5"},
-            {"text": "10 Seconds", "callback_data": "time_10"}
-        ],
-        [
-            {"text": "30 Seconds", "callback_data": "time_30"},
-            {"text": "60 Seconds", "callback_data": "time_60"}
-        ],
-        [
-            {"text": "🔄 Refresh", "callback_data": "autodelete"},
-            {"text": "⬅️ Admin Panel", "callback_data": "admin"}
-        ]
-    ])
-
-    send_message(
-        chat_id,
-        "<b>🗑 AUTO DELETE SETTINGS</b>\n\n"
-        f"Status: {'ON 🟢' if enabled else 'OFF 🔴'}\n"
-        f"Delete time: {seconds} seconds\n\n"
-        "This setting applies to bot and user messages.",
+        "<b>⚡ AMR CLOUD ADMIN PANEL</b>\n\n"
+        "Select an option:",
         keyboard
     )
 
 
 # ==================================================
-# USER DATABASE
+# USERS
 # ==================================================
 
 def save_user(user):
+
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO users(user_id, username, first_name)
-        VALUES(%s, %s, %s)
+        INSERT INTO users(user_id,username,first_name)
+        VALUES(%s,%s,%s)
         ON CONFLICT(user_id)
         DO UPDATE SET
             username=EXCLUDED.username,
@@ -485,6 +329,7 @@ def save_user(user):
     ))
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -494,11 +339,12 @@ def save_user(user):
 # ==================================================
 
 def check_force_join(user_id):
+
     conn = db()
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT chat_id, channel_link FROM channels"
+        "SELECT chat_id,channel_link FROM channels"
     )
 
     channels = cur.fetchall()
@@ -509,6 +355,7 @@ def check_force_join(user_id):
     missing = []
 
     for channel in channels:
+
         result = tg("getChatMember", {
             "chat_id": channel["chat_id"],
             "user_id": user_id
@@ -520,11 +367,11 @@ def check_force_join(user_id):
 
         status = result["result"]["status"]
 
-        if status not in [
+        if status not in (
             "member",
             "administrator",
             "creator"
-        ]:
+        ):
             missing.append(channel)
 
     return missing
@@ -535,6 +382,7 @@ def check_force_join(user_id):
 # ==================================================
 
 def get_media(message):
+
     media_types = [
         "document",
         "photo",
@@ -546,6 +394,7 @@ def get_media(message):
     ]
 
     for media_type in media_types:
+
         if media_type not in message:
             continue
 
@@ -554,9 +403,12 @@ def get_media(message):
         if media_type == "photo":
             media = media[-1]
 
-        file_name = media.get("file_name") or (
-            f"{media_type}_{uuid.uuid4().hex[:8]}"
-        )
+        file_name = media.get("file_name")
+
+        if not file_name:
+            file_name = (
+                f"{media_type}_{uuid.uuid4().hex[:8]}"
+            )
 
         mime_type = media.get("mime_type")
 
@@ -578,6 +430,7 @@ def get_media(message):
 
 
 def save_file(media):
+
     token = secrets.token_urlsafe(12)
 
     conn = db()
@@ -585,10 +438,10 @@ def save_file(media):
 
     cur.execute("""
         INSERT INTO files(
-            token, file_id, file_name,
-            file_type, file_size, mime_type
+            token,file_id,file_name,
+            file_type,file_size,mime_type
         )
-        VALUES(%s, %s, %s, %s, %s, %s)
+        VALUES(%s,%s,%s,%s,%s,%s)
     """, (
         token,
         media["file_id"],
@@ -599,6 +452,7 @@ def save_file(media):
     ))
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -606,6 +460,7 @@ def save_file(media):
 
 
 def get_file(token):
+
     conn = db()
     cur = conn.cursor()
 
@@ -623,6 +478,7 @@ def get_file(token):
 
 
 def delete_file(token):
+
     conn = db()
     cur = conn.cursor()
 
@@ -634,22 +490,20 @@ def delete_file(token):
     deleted = cur.rowcount
 
     conn.commit()
+
     cur.close()
     conn.close()
 
     return deleted
 
 
-# ==================================================
-# FILE LIST
-# ==================================================
-
 def show_files(chat_id):
+
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT token, file_name, file_type
+        SELECT token,file_name,file_type
         FROM files
         ORDER BY id DESC
         LIMIT 30
@@ -661,33 +515,34 @@ def show_files(chat_id):
     conn.close()
 
     if not files:
-        send_message(chat_id, "No files uploaded yet.")
+
+        send_message(chat_id, "📁 No files uploaded yet.")
         return
 
-    for file in files:
-        name = html.escape(file["file_name"] or "Unnamed")
+    for f in files:
 
         keyboard = inline_keyboard([[
             {
                 "text": "❌ Delete",
-                "callback_data": "delete_" + file["token"]
+                "callback_data": "delete_" + f["token"]
             }
         ]])
 
         send_message(
             chat_id,
-            f"<b>{name}</b>\n"
-            f"Type: {file['file_type']}\n"
-            f"Token: <code>{file['token']}</code>",
+            f"<b>{escape(f['file_name'] or 'Unnamed')}</b>\n"
+            f"Type: {escape(f['file_type'] or 'Unknown')}\n"
+            f"Token: <code>{escape(f['token'])}</code>",
             keyboard
         )
 
 
 # ==================================================
-# STATUS
+# STATISTICS
 # ==================================================
 
 def show_status(chat_id):
+
     conn = db()
     cur = conn.cursor()
 
@@ -697,14 +552,10 @@ def show_status(chat_id):
     cur.execute("SELECT COUNT(*) AS n FROM files")
     files = cur.fetchone()["n"]
 
-    cur.execute(
-        "SELECT COALESCE(SUM(views), 0) AS n FROM files"
-    )
+    cur.execute("SELECT COALESCE(SUM(views),0) AS n FROM files")
     views = cur.fetchone()["n"]
 
-    cur.execute(
-        "SELECT COALESCE(SUM(downloads), 0) AS n FROM files"
-    )
+    cur.execute("SELECT COALESCE(SUM(downloads),0) AS n FROM files")
     downloads = cur.fetchone()["n"]
 
     cur.close()
@@ -725,6 +576,7 @@ def show_status(chat_id):
 # ==================================================
 
 def broadcast(text):
+
     conn = db()
     cur = conn.cursor()
 
@@ -737,29 +589,30 @@ def broadcast(text):
     sent = 0
 
     for user in users:
-        result = send_message(user["user_id"], text)
+
+        result = send_message(
+            user["user_id"],
+            text
+        )
 
         if result.get("ok"):
             sent += 1
-
-        time.sleep(0.05)
 
     return sent
 
 
 # ==================================================
-# START
+# START / HELP / STAR
 # ==================================================
 
 def handle_start(message):
+
     user = message["from"]
     chat_id = message["chat"]["id"]
 
     save_user(user)
 
-    text = message.get("text", "")
-    parts = text.split(maxsplit=1)
-
+    parts = message.get("text", "").split(maxsplit=1)
     payload = parts[1] if len(parts) > 1 else ""
 
     if is_admin(user["id"]) and not payload:
@@ -769,9 +622,11 @@ def handle_start(message):
     missing = check_force_join(user["id"])
 
     if missing:
+
         rows = []
 
         for channel in missing:
+
             rows.append([{
                 "text": "📢 Join Channel",
                 "url": channel["channel_link"]
@@ -784,44 +639,64 @@ def handle_start(message):
 
         send_message(
             chat_id,
-            "🔒 <b>Join our required channels first.</b>",
+            "🔒 <b>Please join all required channels first.</b>",
             inline_keyboard(rows)
         )
+
         return
 
     if payload.startswith("f_"):
-        token = payload[2:]
 
+        token = payload[2:]
         file = get_file(token)
 
         if not file:
             send_message(chat_id, "❌ File not found.")
             return
 
-        if not BASE_URL:
-            send_message(chat_id, "❌ Website URL is not configured.")
-            return
-
         url = f"{BASE_URL}/file/{token}"
 
         send_message(
             chat_id,
-            "✅ File available!\n\n"
-            f"<b>{html.escape(file['file_name'] or 'File')}</b>\n\n"
-            "Open the secure file page below:",
+            "✅ <b>File available!</b>\n\n"
+            f"📁 {escape(file['file_name'] or 'File')}\n\n"
+            "Open the secure file page:",
             inline_keyboard([[
                 {"text": "🌐 OPEN FILE", "url": url}
             ]])
         )
+
         return
 
     custom = get_setting(
         "start_message",
         "👋 Welcome to <b>AMR CLOUD</b>!\n\n"
-        "Send a file to access your download link."
+        "Send /help to see available commands."
     )
 
     send_message(chat_id, custom)
+
+
+def handle_help(chat_id):
+
+    send_message(
+        chat_id,
+        "<b>☁️ AMR CLOUD HELP</b>\n\n"
+        "/start - Start the bot\n"
+        "/help - Show help\n"
+        "/star - Support message\n"
+        "/cancel - Cancel current action"
+    )
+
+
+def handle_star(chat_id):
+
+    text = get_setting(
+        "star_message",
+        "⭐ Thank you for supporting AMR CLOUD!"
+    )
+
+    send_message(chat_id, text)
 
 
 # ==================================================
@@ -829,6 +704,7 @@ def handle_start(message):
 # ==================================================
 
 def handle_message(message):
+
     user = message.get("from", {})
     chat_id = message["chat"]["id"]
 
@@ -836,41 +712,85 @@ def handle_message(message):
         return
 
     user_id = user["id"]
+    text = message.get("text", "")
 
-    try:
-        save_user(user)
-    except Exception:
-        logging.exception("Could not save user")
+    # Commands
 
-    if message.get("text", "").startswith("/start"):
+    if text.startswith("/start"):
         handle_start(message)
         return
 
+    if text.startswith("/help"):
+        handle_help(chat_id)
+        return
+
+    if text.startswith("/star"):
+        handle_star(chat_id)
+        return
+
+    if text.startswith("/cancel"):
+
+        clear_state(user_id)
+
+        send_message(
+            chat_id,
+            "✅ Current action cancelled."
+        )
+
+        return
+
+    if text.startswith("/admin"):
+
+        if is_admin(user_id):
+            clear_state(user_id)
+            admin_panel(chat_id)
+        else:
+            send_message(chat_id, "⛔ Access denied.")
+
+        return
+
+    if text.startswith("/stats"):
+
+        if is_admin(user_id):
+            show_status(chat_id)
+        else:
+            send_message(chat_id, "⛔ Access denied.")
+
+        return
+
+    # Admin states
+
     if is_admin(user_id):
-        state = admin_states.get(user_id)
+
+        state = get_state(user_id)
 
         if state == "startmsg":
-            set_setting(
-                "start_message",
-                message.get("text", "")
-            )
 
-            admin_states.pop(user_id, None)
+            if not text:
+                send_message(chat_id, "Please send text.")
+                return
+
+            set_setting("start_message", text)
+            clear_state(user_id)
+
             send_message(chat_id, "✅ Start message updated.")
             return
 
         if state == "starmsg":
-            set_setting(
-                "star_message",
-                message.get("text", "")
-            )
 
-            admin_states.pop(user_id, None)
+            if not text:
+                send_message(chat_id, "Please send text.")
+                return
+
+            set_setting("star_message", text)
+            clear_state(user_id)
+
             send_message(chat_id, "✅ Star message updated.")
             return
 
         if state == "addchannel":
-            parts = message.get("text", "").split()
+
+            parts = text.split()
 
             if len(parts) < 2:
                 send_message(
@@ -883,12 +803,16 @@ def handle_message(message):
             channel_id = parts[0]
             channel_link = parts[1]
 
+            if not channel_link.startswith("https://t.me/"):
+                send_message(chat_id, "❌ Invalid channel link.")
+                return
+
             conn = db()
             cur = conn.cursor()
 
             cur.execute("""
-                INSERT INTO channels(chat_id, channel_link)
-                VALUES(%s, %s)
+                INSERT INTO channels(chat_id,channel_link)
+                VALUES(%s,%s)
                 ON CONFLICT(chat_id)
                 DO UPDATE SET channel_link=EXCLUDED.channel_link
             """, (channel_id, channel_link))
@@ -897,14 +821,20 @@ def handle_message(message):
             cur.close()
             conn.close()
 
-            admin_states.pop(user_id, None)
+            clear_state(user_id)
+
             send_message(chat_id, "✅ Channel configured.")
             return
 
         if state == "broadcast":
-            admin_states.pop(user_id, None)
 
-            sent = broadcast(message.get("text", ""))
+            if not text:
+                send_message(chat_id, "Please send broadcast text.")
+                return
+
+            clear_state(user_id)
+
+            sent = broadcast(text)
 
             send_message(
                 chat_id,
@@ -914,10 +844,17 @@ def handle_message(message):
 
         media = get_media(message)
 
-        if state == "upload" and media:
-            token = save_file(media)
+        if state == "upload":
 
-            admin_states.pop(user_id, None)
+            if not media:
+                send_message(
+                    chat_id,
+                    "❌ Unsupported file. Send a document, photo, video or audio."
+                )
+                return
+
+            token = save_file(media)
+            clear_state(user_id)
 
             link = (
                 f"https://t.me/{BOT_USERNAME}"
@@ -927,13 +864,17 @@ def handle_message(message):
             send_message(
                 chat_id,
                 "✅ <b>FILE UPLOADED</b>\n\n"
-                f"📁 {html.escape(media['file_name'])}\n"
-                f"📦 {media['file_size']} bytes\n\n"
+                f"📁 {escape(media['file_name'])}\n"
+                f"📦 {format_size(media['file_size'])}\n\n"
                 f"<code>{link}</code>"
             )
+
             return
 
+    # Non-admin file uploads
+
     if get_media(message):
+
         send_message(
             chat_id,
             "Please use the file links provided by AMR CLOUD."
@@ -945,15 +886,17 @@ def handle_message(message):
 # ==================================================
 
 def handle_callback(callback):
-    data = callback["data"]
+
+    data = callback.get("data", "")
     user_id = callback["from"]["id"]
 
-    message = callback["message"]
-    chat_id = message["chat"]["id"]
+    message = callback.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
 
     answer_callback(callback["id"])
 
     if data == "verify":
+
         missing = check_force_join(user_id)
 
         if missing:
@@ -973,35 +916,19 @@ def handle_callback(callback):
         return
 
     if data == "admin":
+        clear_state(user_id)
         admin_panel(chat_id)
         return
 
-    if data == "autodelete":
-        auto_delete_panel(chat_id)
-        return
-
-    if data == "autodel_on":
-        set_setting("auto_delete", "on")
-        auto_delete_panel(chat_id)
-        return
-
-    if data == "autodel_off":
-        set_setting("auto_delete", "off")
-        auto_delete_panel(chat_id)
-        return
-
-    if data.startswith("time_"):
-        seconds = data.replace("time_", "", 1)
-
-        if seconds in ["5", "10", "30", "60"]:
-            set_setting("delete_seconds", seconds)
-
-        auto_delete_panel(chat_id)
-        return
-
     if data == "upload":
-        admin_states[user_id] = "upload"
-        send_message(chat_id, "📤 Send your file now.")
+
+        set_state(user_id, "upload")
+
+        send_message(
+            chat_id,
+            "📤 Send your file now.\n\n"
+            "Use /cancel to cancel."
+        )
         return
 
     if data == "files":
@@ -1009,7 +936,8 @@ def handle_callback(callback):
         return
 
     if data.startswith("delete_"):
-        token = data.replace("delete_", "", 1)
+
+        token = data[len("delete_"):]
         deleted = delete_file(token)
 
         send_message(
@@ -1019,20 +947,51 @@ def handle_callback(callback):
         return
 
     if data == "startmsg":
-        admin_states[user_id] = "startmsg"
-        send_message(chat_id, "Send your new START message.")
+
+        set_state(user_id, "startmsg")
+
+        send_message(
+            chat_id,
+            "✏️ Send your new START message.\n"
+            "Use /cancel to cancel."
+        )
         return
 
     if data == "starmsg":
-        admin_states[user_id] = "starmsg"
-        send_message(chat_id, "Send your new STAR message.")
+
+        set_state(user_id, "starmsg")
+
+        send_message(
+            chat_id,
+            "⭐ Send your new STAR message.\n"
+            "Use /cancel to cancel."
+        )
         return
 
     if data == "channels":
+
         keyboard = inline_keyboard([
-            [{"text": "➕ Add Channel", "callback_data": "addchannel"}],
-            [{"text": "📋 Channel List", "callback_data": "channellist"}],
-            [{"text": "❌ Remove Channel", "callback_data": "removechannel"}]
+
+            [{
+                "text": "➕ Add Force Join Channel",
+                "callback_data": "addchannel"
+            }],
+
+            [{
+                "text": "📋 Channel List",
+                "callback_data": "channellist"
+            }],
+
+            [{
+                "text": "❌ Remove Channel",
+                "callback_data": "removechannel"
+            }],
+
+            [{
+                "text": "⬅️ Back",
+                "callback_data": "admin"
+            }]
+
         ])
 
         send_message(
@@ -1043,17 +1002,19 @@ def handle_callback(callback):
         return
 
     if data == "addchannel":
-        admin_states[user_id] = "addchannel"
+
+        set_state(user_id, "addchannel")
 
         send_message(
             chat_id,
             "Send channel username and invite link:\n\n"
             "<code>@channelusername https://t.me/channel</code>\n\n"
-            "Add the bot as an administrator in that channel."
+            "Make sure the bot is an administrator in the channel."
         )
         return
 
     if data == "channellist":
+
         conn = db()
         cur = conn.cursor()
 
@@ -1065,17 +1026,20 @@ def handle_callback(callback):
 
         if not rows:
             send_message(chat_id, "No channels configured.")
-        else:
-            for channel in rows:
-                send_message(
-                    chat_id,
-                    f"{html.escape(channel['chat_id'])}\n"
-                    f"{html.escape(channel['channel_link'])}"
-                )
+            return
+
+        for channel in rows:
+
+            send_message(
+                chat_id,
+                f"<code>{escape(channel['chat_id'])}</code>\n"
+                f"{escape(channel['channel_link'])}"
+            )
 
         return
 
     if data == "removechannel":
+
         conn = db()
         cur = conn.cursor()
 
@@ -1085,10 +1049,15 @@ def handle_callback(callback):
         cur.close()
         conn.close()
 
+        if not rows:
+            send_message(chat_id, "No channels configured.")
+            return
+
         for channel in rows:
+
             send_message(
                 chat_id,
-                html.escape(channel["chat_id"]),
+                f"<code>{escape(channel['chat_id'])}</code>",
                 inline_keyboard([[
                     {
                         "text": "❌ Remove",
@@ -1100,7 +1069,8 @@ def handle_callback(callback):
         return
 
     if data.startswith("rmch_"):
-        channel_id = data.replace("rmch_", "", 1)
+
+        channel_id = data[len("rmch_"):]
 
         conn = db()
         cur = conn.cursor()
@@ -1122,8 +1092,14 @@ def handle_callback(callback):
         return
 
     if data == "broadcast":
-        admin_states[user_id] = "broadcast"
-        send_message(chat_id, "📢 Send the broadcast text.")
+
+        set_state(user_id, "broadcast")
+
+        send_message(
+            chat_id,
+            "📢 Send broadcast text.\n"
+            "Use /cancel to cancel."
+        )
         return
 
 
@@ -1133,24 +1109,24 @@ def handle_callback(callback):
 
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
+
     secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token",
-        ""
+        "X-Telegram-Bot-Api-Secret-Token", ""
     )
 
-    if WEBHOOK_SECRET and not secrets.compare_digest(
-        secret,
-        WEBHOOK_SECRET
-    ):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         abort(403)
 
     update = request.get_json(silent=True) or {}
     update_id = update.get("update_id")
 
+    claimed = False
+
     try:
-        # Claim update transactionally.
-        # If processing fails, remove the claim so Telegram can retry.
+
+        # Claim update before processing to prevent duplicates.
         if update_id is not None:
+
             conn = db()
             cur = conn.cursor()
 
@@ -1170,16 +1146,10 @@ def telegram_webhook():
             if not fresh:
                 return jsonify({"ok": True})
 
+            claimed = True
+
         if "message" in update:
-            message = update["message"]
-
-            # Process first, then schedule deletion of user's message.
-            handle_message(message)
-
-            schedule_delete(
-                message["chat"]["id"],
-                message["message_id"]
-            )
+            handle_message(update["message"])
 
         elif "callback_query" in update:
             handle_callback(update["callback_query"])
@@ -1187,9 +1157,12 @@ def telegram_webhook():
         return jsonify({"ok": True})
 
     except Exception:
-        logging.exception("Webhook update processing failed")
 
-        if update_id is not None:
+        logging.exception("Update processing failed")
+
+        # Remove failed claim so Telegram can retry.
+        if claimed and update_id is not None:
+
             try:
                 conn = db()
                 cur = conn.cursor()
@@ -1214,6 +1187,7 @@ def telegram_webhook():
 # ==================================================
 
 def format_size(size):
+
     size = int(size or 0)
 
     if size < 1024:
@@ -1229,20 +1203,75 @@ def format_size(size):
 
 
 # ==================================================
-# HOME
+# HOME PAGE
 # ==================================================
 
 @app.route("/")
 def home():
-    return """
-    <h1>AMR CLOUD</h1>
-    <p>Secure File Sharing Platform</p>
-    <p>Service is running.</p>
-    """
 
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>AMR CLOUD</title>
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                font-family: Arial, sans-serif;
+                color: white;
+                background:
+                    radial-gradient(circle at 10% 10%, #29205c, transparent 40%),
+                    radial-gradient(circle at 90% 90%, #174a57, transparent 40%),
+                    #080b14;
+            }
+            .card {
+                width: 90%;
+                max-width: 440px;
+                padding: 35px 25px;
+                border: 1px solid #ffffff24;
+                border-radius: 25px;
+                text-align: center;
+                background: #ffffff12;
+                backdrop-filter: blur(20px);
+                box-shadow: 0 20px 70px #0007;
+            }
+            h1 { font-size: 36px; margin-bottom: 8px; }
+            p { color: #c5c8dc; line-height: 1.6; }
+            .status {
+                display: inline-block;
+                margin-top: 15px;
+                padding: 10px 17px;
+                border-radius: 30px;
+                background: #123e30;
+                color: #80ffba;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>☁️ AMR CLOUD</h1>
+            <p>Secure File Sharing Platform</p>
+            <div class="status">● Service Online</div>
+            <p>Fast • Simple • Secure</p>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+# ==================================================
+# HEALTH
+# ==================================================
 
 @app.route("/health")
 def health():
+
     return jsonify({
         "status": "online",
         "service": "AMR CLOUD"
@@ -1250,11 +1279,12 @@ def health():
 
 
 # ==================================================
-# FILE PAGE
+# FILE WEBPAGE
 # ==================================================
 
 @app.route("/file/<token>")
 def file_page(token):
+
     file = get_file(token)
 
     if not file:
@@ -1272,12 +1302,116 @@ def file_page(token):
     cur.close()
     conn.close()
 
-    return render_template(
-        "file.html",
-        file={
-            **file,
-            "formatted_size": format_size(file["file_size"])
-        }
+    filename = escape(file["file_name"] or "File")
+    size = format_size(file["file_size"])
+
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{{ filename }} - AMR CLOUD</title>
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                padding: 25px 15px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-family: Arial, sans-serif;
+                color: white;
+                background: #080b14;
+            }
+            .card {
+                width: 100%;
+                max-width: 450px;
+                padding: 27px;
+                border-radius: 25px;
+                background: #ffffff10;
+                border: 1px solid #ffffff25;
+                box-shadow: 0 20px 60px #0008;
+            }
+            h1 { margin-top: 0; }
+            .muted { color: #aeb4c8; overflow-wrap: anywhere; }
+            .ad {
+                margin: 18px 0;
+                padding: 22px 10px;
+                border: 1px dashed #68708b;
+                border-radius: 13px;
+                text-align: center;
+                color: #aeb4c8;
+                font-size: 12px;
+            }
+            button {
+                width: 100%;
+                border: 0;
+                border-radius: 12px;
+                padding: 16px;
+                margin-top: 12px;
+                font-weight: bold;
+                font-size: 14px;
+                cursor: pointer;
+                color: white;
+                background: #6655e8;
+            }
+            .download { background: #168c67; }
+            .note {
+                font-size: 12px;
+                color: #aeb4c8;
+                line-height: 1.5;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>☁️ AMR CLOUD</h1>
+            <p class="muted">Secure File Sharing</p>
+
+            <hr style="border-color:#ffffff22">
+
+            <h3>📁 {{ filename }}</h3>
+            <p class="muted">File size: {{ size }}</p>
+
+            <div class="ad">
+                ADVERTISEMENT<br>
+                Ad Placement 1
+            </div>
+
+            <div class="ad">
+                ADVERTISEMENT<br>
+                Ad Placement 2
+            </div>
+
+            <form method="POST" action="/access/{{ token }}">
+                <button type="submit">
+                    ACCESS WITH 2 ADS
+                </button>
+            </form>
+
+            <p class="note">
+                Advertisement spaces are separate from file access.
+                Viewing an advertisement is not automatically verified.
+            </p>
+
+            <div class="ad">
+                ADVERTISEMENT<br>
+                Download Ad Placement
+            </div>
+
+            <form method="POST" action="/download/{{ token }}">
+                <button class="download" type="submit">
+                    DOWNLOAD
+                </button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """,
+        filename=filename,
+        size=size,
+        token=token
     )
 
 
@@ -1287,6 +1421,7 @@ def file_page(token):
 
 @app.route("/access/<token>", methods=["POST"])
 def access_file(token):
+
     file = get_file(token)
 
     if not file:
@@ -1314,6 +1449,7 @@ def access_file(token):
 
 @app.route("/download/<token>", methods=["POST"])
 def download_file(token):
+
     file = get_file(token)
 
     if not file:
@@ -1322,6 +1458,7 @@ def download_file(token):
     if request.cookies.get(
         f"amr_access_{token}"
     ) != "authorized":
+
         return redirect(f"/file/{token}")
 
     result = tg("getFile", {
@@ -1339,6 +1476,7 @@ def download_file(token):
     )
 
     try:
+
         r = requests.get(
             download_url,
             stream=True,
@@ -1368,10 +1506,9 @@ def download_file(token):
         conn.close()
 
         def generate():
+
             try:
-                for chunk in r.iter_content(
-                    chunk_size=64 * 1024
-                ):
+                for chunk in r.iter_content(64 * 1024):
                     if chunk:
                         yield chunk
             finally:
@@ -1390,6 +1527,7 @@ def download_file(token):
         )
 
     except Exception:
+
         logging.exception("Download error")
         return "Download error.", 500
 
@@ -1400,6 +1538,7 @@ def download_file(token):
 
 @app.route("/setup-webhook")
 def setup_webhook():
+
     secret = request.args.get("secret", "")
 
     if not UPDATE_SECRET or not secrets.compare_digest(
@@ -1411,18 +1550,18 @@ def setup_webhook():
     if not BASE_URL:
         return jsonify({
             "ok": False,
-            "error": "RENDER_EXTERNAL_URL is missing"
+            "error": "RENDER_EXTERNAL_URL missing"
         }), 500
 
-    webhook_url = f"{BASE_URL}/telegram-webhook"
-
-    result = tg("setWebhook", {
-        "url": webhook_url,
-        "secret_token": WEBHOOK_SECRET,
+    webhook_data = {
+        "url": f"{BASE_URL}/telegram-webhook",
         "drop_pending_updates": False
-    })
+    }
 
-    return jsonify(result)
+    if WEBHOOK_SECRET:
+        webhook_data["secret_token"] = WEBHOOK_SECRET
+
+    return jsonify(tg("setWebhook", webhook_data))
 
 
 # ==================================================
@@ -1431,14 +1570,12 @@ def setup_webhook():
 
 init_db()
 
-start_auto_delete_worker()
-
-logging.info("AMR CLOUD database initialized.")
-logging.info("Auto-delete worker started.")
+logging.info("AMR CLOUD is ready.")
 
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
-        )
+        port=int(os.getenv("PORT", "5000"))
+    )
