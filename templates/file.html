@@ -1,148 +1,155 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
+
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#080b14">
 
-<meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ file.file_name }} | VIRAL5X CLOUD</title>
 
-<title>{{ file_name }} | AMR Cloud</title>
-
-<style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    background: #080b12;
-    color: white;
-    font-family: Arial, sans-serif;
-    padding: 20px;
-}
-
-.container {
-    max-width: 650px;
-    margin: 40px auto;
-}
-
-.logo {
-    text-align: center;
-    font-size: 30px;
-    font-weight: bold;
-    letter-spacing: 4px;
-}
-
-.logo span {
-    color: #829cff;
-}
-
-.ad {
-    min-height: 90px;
-    margin: 25px 0;
-    border: 1px dashed #424d66;
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #8992a5;
-    font-size: 12px;
-}
-
-.card {
-    padding: 25px;
-    border-radius: 18px;
-    background: #111827;
-    border: 1px solid #26334a;
-}
-
-.filename {
-    font-size: 20px;
-    overflow-wrap: anywhere;
-}
-
-.info {
-    color: #a4adbd;
-    font-size: 14px;
-    margin: 15px 0;
-}
-
-.preview {
-    width: 100%;
-    max-height: 400px;
-    margin: 15px 0;
-    border-radius: 10px;
-    background: #05070b;
-}
-
-.download {
-    display: block;
-    text-align: center;
-    background: #6d8cff;
-    color: white;
-    padding: 17px;
-    border-radius: 10px;
-    text-decoration: none;
-    font-weight: bold;
-    margin-top: 20px;
-}
-
-</style>
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
 </head>
 
 <body>
 
-<div class="container">
-
-    <div class="logo">
-        AMR <span>CLOUD</span>
-    </div>
-
-    <div class="ad">
-        Advertisement
-    </div>
-
-    <div class="card">
-
-        <h2 class="filename">{{ file_name }}</h2>
-
-        <div class="info">
-            File size:
-            {{ "%.2f"|format(file_size / 1048576) }} MB
-        </div>
-
-        <div class="info">
-            Type: {{ mime_type }}
-        </div>
-
-        {% if mime_type.startswith('image/') %}
-        <img class="preview"
-        src="/download/{{ token }}?preview=1">
-        {% elif mime_type == 'application/pdf' %}
-        <iframe class="preview"
-        src="/download/{{ token }}?preview=1"
-        height="400"></iframe>
-        {% elif mime_type.startswith('video/') %}
-        <video class="preview" controls>
-        <source src="/download/{{ token }}?preview=1">
-        </video>
-        {% endif %}
-
-        <a class="download"
-        href="/download/{{ token }}">
-        DOWNLOAD FILE
-        </a>
-
-    </div>
-
-    <div class="ad">
-        Advertisement
-    </div>
-
-    <p style="text-align:center;color:#667085">
-        © 2026 AMR Cloud
-    </p>
-
+<div class="background">
+    <div class="orb orb1"></div>
+    <div class="orb orb2"></div>
 </div>
+
+<header class="navbar">
+
+    <a href="/" class="logo">
+        <span class="logo-icon">A</span>
+        <span>AMR <b>CLOUD</b></span>
+    </a>
+
+    <div class="secure">
+        <span></span> SECURE STORAGE
+    </div>
+
+</header>
+
+<main class="main">
+
+    <section class="card">
+
+        <div class="badge">
+            <span></span> FILE AVAILABLE
+        </div>
+
+        <div class="file-icon" id="fileIcon">
+            📁
+        </div>
+
+        <h1>{{ file.file_name }}</h1>
+
+        <p class="subtitle">
+            Your file is ready to access.
+        </p>
+
+        <div class="file-info">
+
+            <div class="info-box">
+                <small>FILE TYPE</small>
+                <strong>{{ file.file_type }}</strong>
+            </div>
+
+            <div class="info-box">
+                <small>FILE SIZE</small>
+                <strong>{{ file.formatted_size }}</strong>
+            </div>
+
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- ACCESS SECTION -->
+
+        <div class="section-heading">
+            <div class="number">01</div>
+
+            <div>
+                <h3>Access Your File</h3>
+                <p>Continue to the file access page.</p>
+            </div>
+        </div>
+
+        <!-- Ad placement 1 -->
+        <div class="ad-container">
+            <span class="ad-label">ADVERTISEMENT</span>
+
+            <div class="ad-slot">
+                Ad Placement 1
+            </div>
+        </div>
+
+        <!-- Ad placement 2 -->
+        <div class="ad-container">
+            <span class="ad-label">ADVERTISEMENT</span>
+
+            <div class="ad-slot">
+                Ad Placement 2
+            </div>
+        </div>
+
+        <form action="/access/{{ file.token }}" method="POST">
+
+            <button class="btn access-btn" type="submit">
+                <span>ACCESS WITH 2 ADS</span>
+                <span>↗</span>
+            </button>
+
+        </form>
+
+        <!-- DOWNLOAD SECTION -->
+
+        <div class="divider"></div>
+
+        <div class="section-heading">
+            <div class="number">02</div>
+
+            <div>
+                <h3>Download Your File</h3>
+                <p>Download the original file.</p>
+            </div>
+        </div>
+
+        <!-- Ad placement 3 -->
+        <div class="ad-container">
+            <span class="ad-label">ADVERTISEMENT</span>
+
+            <div class="ad-slot">
+                Download Ad Placement
+            </div>
+        </div>
+
+        <form action="/download/{{ file.token }}"
+              method="POST"
+              id="downloadForm">
+
+            <button class="btn download-btn" type="submit">
+                <span>DOWNLOAD WITH 1 AD</span>
+                <span>↓</span>
+            </button>
+
+        </form>
+
+        <div class="footer-note">
+            🔒 Secure file delivery by VIRAL5X CLOUD
+        </div>
+
+    </section>
+
+    <footer>
+        © 2026 AMR CLOUD · All Rights Reserved
+    </footer>
+
+</main>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
 
 </body>
 </html>
