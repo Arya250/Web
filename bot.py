@@ -3,9 +3,9 @@ import uuid
 import secrets
 import mimetypes
 import logging
-
 import requests
 import psycopg2
+import html
 
 from urllib.parse import quote
 
@@ -18,13 +18,15 @@ from flask import (
     abort
 )
 
+from jinja2 import TemplateNotFound
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==========================================
+
+# ==================================================
 # AMR CLOUD CONFIGURATION
-# ==========================================
+# ==================================================
 
 app = Flask(__name__)
 
@@ -35,23 +37,34 @@ logging.basicConfig(
 
 logger = logging.getLogger("AMR-CLOUD")
 
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 BOT_USERNAME = os.getenv(
     "BOT_USERNAME", ""
 ).strip().lstrip("@")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+except ValueError:
+    ADMIN_ID = 0
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", ""
+).strip()
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+WEBHOOK_SECRET = os.getenv(
+    "WEBHOOK_SECRET", ""
+).strip()
 
-UPDATE_SECRET = os.getenv("UPDATE_SECRET", "").strip()
+UPDATE_SECRET = os.getenv(
+    "UPDATE_SECRET", ""
+).strip()
 
 SITE_URL = os.getenv(
     "RENDER_EXTERNAL_URL", ""
 ).strip().rstrip("/")
+
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -60,9 +73,9 @@ MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024
 REQUEST_TIMEOUT = 30
 
 
-# ==========================================
+# ==================================================
 # DATABASE CONNECTION
-# ==========================================
+# ==================================================
 
 def db():
 
@@ -75,9 +88,9 @@ def db():
     )
 
 
-# ==========================================
+# ==================================================
 # DATABASE INITIALIZATION
-# ==========================================
+# ==================================================
 
 def init_db():
 
@@ -104,7 +117,8 @@ def init_db():
 
                         file_size BIGINT DEFAULT 0,
 
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP
+                            DEFAULT CURRENT_TIMESTAMP,
 
                         downloads INTEGER DEFAULT 0,
 
@@ -118,21 +132,24 @@ def init_db():
 
                         update_id BIGINT PRIMARY KEY,
 
-                        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        processed_at TIMESTAMP
+                            DEFAULT CURRENT_TIMESTAMP
 
                     )
                 """)
 
-        logger.info("Database initialized successfully")
+        logger.info(
+            "AMR CLOUD database initialized successfully"
+        )
 
     finally:
 
         con.close()
 
 
-# ==========================================
+# ==================================================
 # TELEGRAM API
-# ==========================================
+# ==================================================
 
 def telegram(method, data=None):
 
@@ -140,13 +157,9 @@ def telegram(method, data=None):
         raise RuntimeError("BOT_TOKEN is missing")
 
     response = requests.post(
-
         f"{API}/{method}",
-
         json=data or {},
-
         timeout=REQUEST_TIMEOUT
-
     )
 
     response.raise_for_status()
@@ -156,60 +169,61 @@ def telegram(method, data=None):
     if not result.get("ok"):
 
         raise RuntimeError(
-            result.get("description", "Telegram API error")
+            result.get(
+                "description",
+                "Telegram API error"
+            )
         )
 
     return result["result"]
 
 
-# ==========================================
+# ==================================================
 # SEND MESSAGE
-# ==========================================
+# ==================================================
 
 def send_message(chat_id, message):
 
-    return telegram("sendMessage", {
+    return telegram(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": True
+        }
+    )
 
-        "chat_id": chat_id,
 
-        "text": message,
-
-        "disable_web_page_preview": True
-
-    })
-
-
-# ==========================================
+# ==================================================
 # WEBHOOK CONFIGURATION
-# ==========================================
+# ==================================================
 
 def configure_webhook():
 
-    if not all([
-        BOT_TOKEN,
-        WEBHOOK_SECRET,
-        SITE_URL
-    ]):
-
-        logger.error(
-            "Missing BOT_TOKEN, WEBHOOK_SECRET or RENDER_EXTERNAL_URL"
-        )
-
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN missing")
         return False
+
+    if not WEBHOOK_SECRET:
+        logger.error("WEBHOOK_SECRET missing")
+        return False
+
+    if not SITE_URL:
+        logger.error("RENDER_EXTERNAL_URL missing")
+        return False
+
+    webhook_url = SITE_URL + "/telegram-webhook"
 
     try:
 
-        webhook_url = SITE_URL + "/telegram-webhook"
-
-        result = telegram("setWebhook", {
-
-            "url": webhook_url,
-
-            "secret_token": WEBHOOK_SECRET,
-
-            "allowed_updates": ["message"]
-
-        })
+        result = telegram(
+            "setWebhook",
+            {
+                "url": webhook_url,
+                "secret_token": WEBHOOK_SECRET,
+                "allowed_updates": ["message"]
+            }
+        )
 
         logger.info(
             "Webhook configured successfully: %s",
@@ -220,14 +234,16 @@ def configure_webhook():
 
     except Exception:
 
-        logger.exception("Webhook configuration failed")
+        logger.exception(
+            "Webhook configuration failed"
+        )
 
         return False
 
 
-# ==========================================
+# ==================================================
 # FILE DETECTION
-# ==========================================
+# ==================================================
 
 def get_file_object(message):
 
@@ -240,7 +256,6 @@ def get_file_object(message):
     ):
 
         if key in message:
-
             return message[key]
 
     if "photo" in message:
@@ -250,9 +265,9 @@ def get_file_object(message):
     return None
 
 
-# ==========================================
+# ==================================================
 # FILE STORAGE
-# ==========================================
+# ==================================================
 
 def save_file(file_obj):
 
@@ -260,9 +275,9 @@ def save_file(file_obj):
 
     file_name = file_obj.get("file_name")
 
-    if not file_name:
+    mime = file_obj.get("mime_type", "")
 
-        mime = file_obj.get("mime_type", "")
+    if not file_name:
 
         extension = (
             mimetypes.guess_extension(mime) or ""
@@ -274,7 +289,7 @@ def save_file(file_obj):
 
     mime_type = (
 
-        file_obj.get("mime_type")
+        mime
 
         or mimetypes.guess_type(file_name)[0]
 
@@ -282,7 +297,9 @@ def save_file(file_obj):
 
     )
 
-    file_size = file_obj.get("file_size", 0)
+    file_size = int(
+        file_obj.get("file_size") or 0
+    )
 
     if file_size > MAX_DOWNLOAD_SIZE:
 
@@ -332,9 +349,9 @@ def save_file(file_obj):
     return token, None
 
 
-# ==========================================
+# ==================================================
 # GET FILE
-# ==========================================
+# ==================================================
 
 def get_file(token):
 
@@ -369,11 +386,11 @@ def get_file(token):
         con.close()
 
 
-# ==========================================
-# MARK UPDATE AS PROCESSED
-# ==========================================
+# ==================================================
+# DUPLICATE UPDATE PROTECTION
+# ==================================================
 
-def mark_update_processed(update_id):
+def claim_update(update_id):
 
     con = db()
 
@@ -385,11 +402,41 @@ def mark_update_processed(update_id):
 
                 cur.execute("""
 
-                    INSERT INTO processed_updates (update_id)
+                    INSERT INTO processed_updates (
+                        update_id
+                    )
 
                     VALUES (%s)
 
-                    ON CONFLICT (update_id) DO NOTHING
+                    ON CONFLICT (update_id)
+                    DO NOTHING
+
+                    RETURNING update_id
+
+                """, (update_id,))
+
+                return cur.fetchone() is not None
+
+    finally:
+
+        con.close()
+
+
+def release_update(update_id):
+
+    con = db()
+
+    try:
+
+        with con:
+
+            with con.cursor() as cur:
+
+                cur.execute("""
+
+                    DELETE FROM processed_updates
+
+                    WHERE update_id = %s
 
                 """, (update_id,))
 
@@ -398,42 +445,11 @@ def mark_update_processed(update_id):
         con.close()
 
 
-# ==========================================
-# CHECK DUPLICATE UPDATE
-# ==========================================
-
-def is_update_processed(update_id):
-
-    con = db()
-
-    try:
-
-        with con.cursor() as cur:
-
-            cur.execute("""
-
-                SELECT 1
-
-                FROM processed_updates
-
-                WHERE update_id = %s
-
-            """, (update_id,))
-
-            return cur.fetchone() is not None
-
-    finally:
-
-        con.close()
-
-
-# ==========================================
-# START COMMAND HANDLER
-# ==========================================
+# ==================================================
+# START COMMAND
+# ==================================================
 
 def handle_start(chat_id, user_id, payload):
-
-    # FILE LINK ACCESS
 
     if payload.startswith("f_"):
 
@@ -458,15 +474,13 @@ def handle_start(chat_id, user_id, payload):
 
             "YOUR FILE IS READY!\n\n"
 
-            "Click below to open the file webpage:\n\n"
+            "Your file is available below:\n\n"
 
             f"{webpage}"
 
         )
 
         return
-
-    # ADMIN START
 
     if user_id == ADMIN_ID:
 
@@ -478,11 +492,9 @@ def handle_start(chat_id, user_id, payload):
 
             "Send a file to upload.\n\n"
 
-            "AVAILABLE COMMANDS:\n\n"
+            "ADMIN COMMANDS:\n\n"
 
-            "/start - Admin menu\n"
-
-            "/stats - File statistics\n"
+            "/stats - Statistics\n"
 
             "/delete TOKEN - Delete file"
 
@@ -490,24 +502,22 @@ def handle_start(chat_id, user_id, payload):
 
         return
 
-    # NORMAL USER START
-
     send_message(
 
         chat_id,
 
         "WELCOME TO AMR CLOUD!\n\n"
 
-        "This is an admin-managed file platform.\n\n"
+        "AMR CLOUD is an admin-managed file platform.\n\n"
 
-        "Open a valid file link to access your file."
+        "Open a valid file sharing link to access your file."
 
     )
 
 
-# ==========================================
+# ==================================================
 # ADMIN STATISTICS
-# ==========================================
+# ==================================================
 
 def admin_stats(chat_id):
 
@@ -552,9 +562,9 @@ def admin_stats(chat_id):
     )
 
 
-# ==========================================
+# ==================================================
 # ADMIN DELETE
-# ==========================================
+# ==================================================
 
 def admin_delete(chat_id, token):
 
@@ -576,13 +586,13 @@ def admin_delete(chat_id, token):
 
                 """, (token,))
 
-                result = cur.fetchone()
+                deleted = cur.fetchone()
 
     finally:
 
         con.close()
 
-    if result:
+    if deleted:
 
         send_message(
             chat_id,
@@ -597,9 +607,9 @@ def admin_delete(chat_id, token):
         )
 
 
-# ==========================================
+# ==================================================
 # TELEGRAM WEBHOOK
-# ==========================================
+# ==================================================
 
 @app.route(
     "/telegram-webhook",
@@ -609,17 +619,17 @@ def admin_delete(chat_id, token):
 def webhook():
 
     incoming_secret = request.headers.get(
-
         "X-Telegram-Bot-Api-Secret-Token",
         ""
-
     )
 
-    if not WEBHOOK_SECRET or not secrets.compare_digest(
+    if not WEBHOOK_SECRET:
 
+        abort(403)
+
+    if not secrets.compare_digest(
         incoming_secret,
         WEBHOOK_SECRET
-
     ):
 
         abort(403)
@@ -634,9 +644,9 @@ def webhook():
 
         return jsonify({"ok": True})
 
-    # DUPLICATE CHECK
+    # Atomically claim the update.
 
-    if is_update_processed(update_id):
+    if not claim_update(update_id):
 
         return jsonify({"ok": True})
 
@@ -654,19 +664,13 @@ def webhook():
             "chat", {}
         ).get("type")
 
-        # ==================================
-        # ONLY PRIVATE CHAT
-        # ==================================
+        # PRIVATE CHAT ONLY
 
         if chat_type != "private":
 
-            mark_update_processed(update_id)
-
             return jsonify({"ok": True})
 
-        # ==================================
-        # START
-        # ==================================
+        # START COMMAND
 
         if text.startswith("/start"):
 
@@ -684,13 +688,9 @@ def webhook():
                 payload
             )
 
-            mark_update_processed(update_id)
-
             return jsonify({"ok": True})
 
-        # ==================================
         # ADMIN SECURITY
-        # ==================================
 
         if user_id != ADMIN_ID:
 
@@ -702,44 +702,41 @@ def webhook():
 
             )
 
-            mark_update_processed(update_id)
-
             return jsonify({"ok": True})
 
-        # ==================================
-        # STATISTICS
-        # ==================================
+        # STATS COMMAND
 
-        if text == "/stats":
+        command = text.split(maxsplit=1)[0].split("@")[0] if text else ""
+
+        if command == "/stats":
 
             admin_stats(chat_id)
 
-            mark_update_processed(update_id)
-
             return jsonify({"ok": True})
 
-        # ==================================
-        # DELETE
-        # ==================================
+        # DELETE COMMAND
 
-        if text.startswith("/delete "):
+        if command == "/delete":
 
-            token = text.split(
-                maxsplit=1
-            )[1].strip()
+            parts = text.split(maxsplit=1)
+
+            if len(parts) != 2:
+
+                send_message(
+                    chat_id,
+                    "Usage: /delete TOKEN"
+                )
+
+                return jsonify({"ok": True})
 
             admin_delete(
                 chat_id,
-                token
+                parts[1].strip()
             )
-
-            mark_update_processed(update_id)
 
             return jsonify({"ok": True})
 
-        # ==================================
         # FILE UPLOAD
-        # ==================================
 
         file_obj = get_file_object(message)
 
@@ -756,6 +753,12 @@ def webhook():
 
             else:
 
+                if not BOT_USERNAME:
+
+                    raise RuntimeError(
+                        "BOT_USERNAME is missing"
+                    )
+
                 deep_link = (
 
                     f"https://t.me/{BOT_USERNAME}"
@@ -764,13 +767,18 @@ def webhook():
 
                 )
 
+                file_name = file_obj.get(
+                    "file_name",
+                    "Media File"
+                )
+
                 send_message(
 
                     chat_id,
 
                     "FILE UPLOADED SUCCESSFULLY!\n\n"
 
-                    f"File: {file_obj.get('file_name', 'Media File')}\n\n"
+                    f"File: {file_name}\n\n"
 
                     "SHARE LINK:\n\n"
 
@@ -778,19 +786,15 @@ def webhook():
 
                     f"File ID: {token}\n\n"
 
-                    f"Delete command:\n"
+                    "Delete command:\n"
 
                     f"/delete {token}"
 
                 )
 
-            mark_update_processed(update_id)
-
             return jsonify({"ok": True})
 
-        # ==================================
         # UNKNOWN MESSAGE
-        # ==================================
 
         send_message(
 
@@ -800,7 +804,7 @@ def webhook():
 
             "Send a file to upload.\n\n"
 
-            "Commands:\n"
+            "COMMANDS:\n"
 
             "/start\n"
 
@@ -810,8 +814,6 @@ def webhook():
 
         )
 
-        mark_update_processed(update_id)
-
         return jsonify({"ok": True})
 
     except Exception:
@@ -820,23 +822,78 @@ def webhook():
             "Webhook processing failed"
         )
 
+        # Remove the claimed update so Telegram
+        # can retry after a failed operation.
+
+        try:
+
+            release_update(update_id)
+
+        except Exception:
+
+            logger.exception(
+                "Failed to release update"
+            )
+
         abort(500)
 
 
-# ==========================================
+# ==================================================
 # HOME PAGE
-# ==========================================
+# ==================================================
 
 @app.route("/")
 
 def home():
 
-    return render_template("index.html")
+    try:
+
+        return render_template("index.html")
+
+    except TemplateNotFound:
+
+        return Response("""
+
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+            <title>AMR CLOUD</title>
+            <style>
+                body {
+                    background: #101114;
+                    color: white;
+                    font-family: Arial;
+                    text-align: center;
+                    padding: 70px 15px;
+                }
+                .box {
+                    max-width: 450px;
+                    margin: auto;
+                    padding: 35px;
+                    background: #1b1d23;
+                    border-radius: 20px;
+                }
+                h1 { color: #8ab4ff; }
+                p { color: #aaa; }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h1>AMR CLOUD</h1>
+                <p>Your personal file sharing platform.</p>
+                <p>Secure. Simple. Accessible.</p>
+            </div>
+        </body>
+        </html>
+
+        """, content_type="text/html")
 
 
-# ==========================================
+# ==================================================
 # FILE WEBPAGE
-# ==========================================
+# ==================================================
 
 @app.route("/file/<token>")
 
@@ -870,24 +927,104 @@ def file_page(token):
 
         con.close()
 
-    return render_template(
+    try:
 
-        "file.html",
+        return render_template(
 
-        token=result[0],
+            "file.html",
 
-        file_name=result[2],
+            token=result[0],
 
-        mime_type=result[3],
+            file_name=result[2],
 
-        file_size=result[4] or 0
+            mime_type=result[3],
 
-    )
+            file_size=result[4] or 0
+
+        )
+
+    except TemplateNotFound:
+
+        file_name = html.escape(result[2])
+
+        mime_type = html.escape(
+            result[3] or "application/octet-stream"
+        )
+
+        size = result[4] or 0
+
+        return Response(f"""
+
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+
+            <title>{file_name} - AMR CLOUD</title>
+
+            <style>
+                body {{
+                    background: #101114;
+                    color: white;
+                    font-family: Arial;
+                    padding: 30px 15px;
+                    text-align: center;
+                }}
+                .box {{
+                    max-width: 500px;
+                    margin: 50px auto;
+                    padding: 30px;
+                    background: #1b1d23;
+                    border-radius: 20px;
+                }}
+                a {{
+                    display: block;
+                    padding: 15px;
+                    margin: 15px 0;
+                    background: #4779d0;
+                    color: white;
+                    border-radius: 10px;
+                    text-decoration: none;
+                }}
+                .preview {{
+                    background: #333944;
+                }}
+            </style>
+        </head>
+
+        <body>
+
+            <div class="box">
+
+                <h1>AMR CLOUD</h1>
+
+                <h3>{file_name}</h3>
+
+                <p>File size: {size / 1024:.2f} KB</p>
+
+                <p>Type: {mime_type}</p>
+
+                <a class="preview"
+                   href="/download/{token}?preview=1">
+                   Preview File
+                </a>
+
+                <a href="/download/{token}">
+                   Download File
+                </a>
+
+            </div>
+
+        </body>
+        </html>
+
+        """, content_type="text/html")
 
 
-# ==========================================
-# FILE DOWNLOAD / PREVIEW
-# ==========================================
+# ==================================================
+# FILE DOWNLOAD AND PREVIEW
+# ==================================================
 
 @app.route("/download/<token>")
 
@@ -920,11 +1057,8 @@ def download_file(token):
     # GET TELEGRAM FILE PATH
 
     telegram_file = telegram(
-
         "getFile",
-
         {"file_id": file_id}
-
     )
 
     file_path = telegram_file["file_path"]
@@ -982,9 +1116,15 @@ def download_file(token):
     # SAFE FILE NAME
 
     safe_name = (
-        file_name.replace("\r", "")
+
+        file_name
+
+        .replace("\r", "")
+
         .replace("\n", "")
+
         .replace('"', "'")
+
     )
 
     disposition = (
@@ -1036,9 +1176,9 @@ def download_file(token):
     )
 
 
-# ==========================================
+# ==================================================
 # HEALTH CHECK
-# ==========================================
+# ==================================================
 
 @app.route("/health")
 
@@ -1077,9 +1217,9 @@ def health():
         }), 503
 
 
-# ==========================================
+# ==================================================
 # MANUAL WEBHOOK SETUP
-# ==========================================
+# ==================================================
 
 @app.route("/setup-webhook")
 
@@ -1089,7 +1229,11 @@ def setup_webhook():
         "secret", ""
     )
 
-    if not UPDATE_SECRET or not secrets.compare_digest(
+    if not UPDATE_SECRET:
+
+        abort(403)
+
+    if not secrets.compare_digest(
         supplied_secret,
         UPDATE_SECRET
     ):
@@ -1115,15 +1259,17 @@ def setup_webhook():
     }), 500
 
 
-# ==========================================
-# STARTUP
-# ==========================================
+# ==================================================
+# DATABASE STARTUP
+# ==================================================
 
 try:
 
     init_db()
 
-    logger.info("AMR CLOUD database ready")
+    logger.info(
+        "AMR CLOUD database ready"
+    )
 
 except Exception:
 
@@ -1134,9 +1280,21 @@ except Exception:
     raise
 
 
-if __name__ == "__main__":
+# ==================================================
+# AUTOMATIC WEBHOOK SETUP
+# ==================================================
 
-    configure_webhook()
+# Gunicorn imports this module, so this section
+# executes during deployment startup.
+
+configure_webhook()
+
+
+# ==================================================
+# LOCAL DEVELOPMENT
+# ==================================================
+
+if __name__ == "__main__":
 
     app.run(
 
@@ -1144,4 +1302,4 @@ if __name__ == "__main__":
 
         port=int(os.getenv("PORT", 5000))
 
-                )
+        )
