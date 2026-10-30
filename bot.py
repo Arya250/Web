@@ -5,8 +5,6 @@ import secrets
 import logging
 import mimetypes
 from functools import wraps
-from flask
-import render_template
 
 import requests
 import psycopg2
@@ -14,7 +12,8 @@ from psycopg2.extras import RealDictCursor
 
 from flask import (
     Flask, request, jsonify, abort,
-    redirect, make_response, Response
+    redirect, make_response, Response,
+    render_template, stream_with_context
 )
 
 from dotenv import load_dotenv
@@ -47,12 +46,16 @@ app.secret_key = os.getenv(
 
 logging.basicConfig(level=logging.INFO)
 
-# Admin temporary states
 admin_states = {}
+
 
 # ================= DATABASE =================
 
 def db():
+
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing")
+
     return psycopg2.connect(
         DATABASE_URL,
         cursor_factory=RealDictCursor,
@@ -111,6 +114,7 @@ def init_db():
     """)
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -146,6 +150,7 @@ def set_setting(key, value):
     """, (key, value))
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -168,7 +173,11 @@ def tg(method, data=None, files=None):
     except Exception as e:
 
         logging.exception("Telegram API error")
-        return {"ok": False, "description": str(e)}
+
+        return {
+            "ok": False,
+            "description": str(e)
+        }
 
 
 def send_message(chat_id, text, keyboard=None):
@@ -227,26 +236,50 @@ def admin_panel(chat_id):
     keyboard = inline_keyboard([
 
         [
-            {"text": "📤 Upload File", "callback_data": "upload"},
-            {"text": "📁 Uploaded Files", "callback_data": "files"}
+            {
+                "text": "📤 Upload File",
+                "callback_data": "upload"
+            },
+            {
+                "text": "📁 Uploaded Files",
+                "callback_data": "files"
+            }
         ],
 
         [
-            {"text": "✏️ Start Message", "callback_data": "startmsg"},
-            {"text": "⭐ Star Message", "callback_data": "starmsg"}
+            {
+                "text": "✏️ Start Message",
+                "callback_data": "startmsg"
+            },
+            {
+                "text": "⭐ Star Message",
+                "callback_data": "starmsg"
+            }
         ],
 
         [
-            {"text": "🔒 Force Join", "callback_data": "channels"},
-            {"text": "📊 Bot Status", "callback_data": "status"}
+            {
+                "text": "🔒 Force Join",
+                "callback_data": "channels"
+            },
+            {
+                "text": "📊 Bot Status",
+                "callback_data": "status"
+            }
         ],
 
         [
-            {"text": "📢 Broadcast", "callback_data": "broadcast"}
+            {
+                "text": "📢 Broadcast",
+                "callback_data": "broadcast"
+            }
         ],
 
         [
-            {"text": "🔄 Refresh", "callback_data": "admin"}
+            {
+                "text": "🔄 Refresh",
+                "callback_data": "admin"
+            }
         ]
 
     ])
@@ -280,6 +313,7 @@ def save_user(user):
     ))
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -291,7 +325,10 @@ def check_force_join(user_id):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT chat_id,channel_link FROM channels")
+    cur.execute(
+        "SELECT chat_id,channel_link FROM channels"
+    )
+
     channels = cur.fetchall()
 
     cur.close()
@@ -313,7 +350,11 @@ def check_force_join(user_id):
 
         status = result["result"]["status"]
 
-        if status not in ["member", "administrator", "creator"]:
+        if status not in [
+            "member",
+            "administrator",
+            "creator"
+        ]:
 
             missing.append(channel)
 
@@ -343,20 +384,26 @@ def get_media(message):
             if media_type == "photo":
                 media = media[-1]
 
+            original_name = media.get("file_name")
+
+            file_name = original_name or (
+                f"{media_type}_{uuid.uuid4().hex[:8]}"
+            )
+
+            mime_type = media.get("mime_type")
+
+            if not mime_type:
+                mime_type = (
+                    mimetypes.guess_type(file_name)[0]
+                    or "application/octet-stream"
+                )
+
             return {
                 "file_id": media["file_id"],
-                "file_name": media.get(
-                    "file_name",
-                    f"{media_type}_{uuid.uuid4().hex[:8]}"
-                ),
+                "file_name": file_name,
                 "file_type": media_type,
                 "file_size": media.get("file_size", 0),
-                "mime_type": media.get(
-                    "mime_type",
-                    mimetypes.guess_type(
-                        media.get("file_name", "")
-                    )[0] or "application/octet-stream"
-                )
+                "mime_type": mime_type
             }
 
     return None
@@ -371,8 +418,12 @@ def save_file(media):
 
     cur.execute("""
         INSERT INTO files(
-            token,file_id,file_name,file_type,
-            file_size,mime_type
+            token,
+            file_id,
+            file_name,
+            file_type,
+            file_size,
+            mime_type
         )
         VALUES(%s,%s,%s,%s,%s,%s)
     """, (
@@ -385,6 +436,7 @@ def save_file(media):
     ))
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -422,6 +474,7 @@ def delete_file(token):
     deleted = cur.rowcount
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -449,7 +502,11 @@ def show_files(chat_id):
 
     if not files:
 
-        send_message(chat_id, "No files uploaded yet.")
+        send_message(
+            chat_id,
+            "No files uploaded yet."
+        )
+
         return
 
     for f in files:
@@ -477,16 +534,24 @@ def show_status(chat_id):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) AS n FROM users")
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM users"
+    )
     users = cur.fetchone()["n"]
 
-    cur.execute("SELECT COUNT(*) AS n FROM files")
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM files"
+    )
     files = cur.fetchone()["n"]
 
-    cur.execute("SELECT COALESCE(SUM(views),0) AS n FROM files")
+    cur.execute(
+        "SELECT COALESCE(SUM(views),0) AS n FROM files"
+    )
     views = cur.fetchone()["n"]
 
-    cur.execute("SELECT COALESCE(SUM(downloads),0) AS n FROM files")
+    cur.execute(
+        "SELECT COALESCE(SUM(downloads),0) AS n FROM files"
+    )
     downloads = cur.fetchone()["n"]
 
     cur.close()
@@ -509,7 +574,10 @@ def broadcast(text):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT user_id FROM users")
+    cur.execute(
+        "SELECT user_id FROM users"
+    )
+
     users = cur.fetchall()
 
     cur.close()
@@ -583,7 +651,11 @@ def handle_start(message):
 
         if not file:
 
-            send_message(chat_id, "❌ File not found.")
+            send_message(
+                chat_id,
+                "❌ File not found."
+            )
+
             return
 
         url = f"{BASE_URL}/file/{token}"
@@ -612,7 +684,7 @@ def handle_start(message):
     send_message(chat_id, custom)
 
 
-# ================= WEBHOOK MESSAGE HANDLER =================
+# ================= MESSAGE HANDLER =================
 
 def handle_message(message):
 
@@ -629,27 +701,40 @@ def handle_message(message):
         handle_start(message)
         return
 
-    # Admin commands
     if is_admin(user_id):
 
         state = admin_states.get(user_id)
 
         if state == "startmsg":
 
-            set_setting("start_message", message.get("text", ""))
+            set_setting(
+                "start_message",
+                message.get("text", "")
+            )
 
             admin_states.pop(user_id, None)
 
-            send_message(chat_id, "✅ Start message updated.")
+            send_message(
+                chat_id,
+                "✅ Start message updated."
+            )
+
             return
 
         if state == "starmsg":
 
-            set_setting("star_message", message.get("text", ""))
+            set_setting(
+                "star_message",
+                message.get("text", "")
+            )
 
             admin_states.pop(user_id, None)
 
-            send_message(chat_id, "✅ Star message updated.")
+            send_message(
+                chat_id,
+                "✅ Star message updated."
+            )
+
             return
 
         if state == "addchannel":
@@ -660,8 +745,10 @@ def handle_message(message):
 
                 send_message(
                     chat_id,
-                    "Format:\n<code>@channelusername https://t.me/channel</code>"
+                    "Format:\n"
+                    "<code>@channelusername https://t.me/channel</code>"
                 )
+
                 return
 
             channel_id = parts[0]
@@ -675,27 +762,38 @@ def handle_message(message):
                 VALUES(%s,%s)
                 ON CONFLICT(chat_id)
                 DO UPDATE SET channel_link=EXCLUDED.channel_link
-            """, (channel_id, channel_link))
+            """, (
+                channel_id,
+                channel_link
+            ))
 
             conn.commit()
+
             cur.close()
             conn.close()
 
             admin_states.pop(user_id, None)
 
-            send_message(chat_id, "✅ Channel configured.")
+            send_message(
+                chat_id,
+                "✅ Channel configured."
+            )
+
             return
 
         if state == "broadcast":
 
             admin_states.pop(user_id, None)
 
-            sent = broadcast(message.get("text", ""))
+            sent = broadcast(
+                message.get("text", "")
+            )
 
             send_message(
                 chat_id,
                 f"✅ Broadcast completed.\nDelivered: {sent}"
             )
+
             return
 
         media = get_media(message)
@@ -721,7 +819,6 @@ def handle_message(message):
 
             return
 
-    # Normal user file access is not allowed
     if get_media(message):
 
         send_message(
@@ -739,7 +836,6 @@ def handle_callback(callback):
 
     message = callback["message"]
     chat_id = message["chat"]["id"]
-    message_id = message["message_id"]
 
     answer_callback(callback["id"])
 
@@ -795,11 +891,17 @@ def handle_callback(callback):
 
         if deleted:
 
-            send_message(chat_id, "✅ File deleted.")
+            send_message(
+                chat_id,
+                "✅ File deleted."
+            )
 
         else:
 
-            send_message(chat_id, "❌ File not found.")
+            send_message(
+                chat_id,
+                "❌ File not found."
+            )
 
         return
 
@@ -872,7 +974,10 @@ def handle_callback(callback):
         conn = db()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM channels")
+        cur.execute(
+            "SELECT * FROM channels"
+        )
+
         rows = cur.fetchall()
 
         cur.close()
@@ -880,7 +985,10 @@ def handle_callback(callback):
 
         if not rows:
 
-            send_message(chat_id, "No channels configured.")
+            send_message(
+                chat_id,
+                "No channels configured."
+            )
 
         else:
 
@@ -899,7 +1007,10 @@ def handle_callback(callback):
         conn = db()
         cur = conn.cursor()
 
-        cur.execute("SELECT * FROM channels")
+        cur.execute(
+            "SELECT * FROM channels"
+        )
+
         rows = cur.fetchall()
 
         cur.close()
@@ -923,7 +1034,9 @@ def handle_callback(callback):
 
     if data.startswith("rmch_"):
 
-        channel_id = data.replace("rmch_", "", 1)
+        channel_id = data.replace(
+            "rmch_", "", 1
+        )
 
         conn = db()
         cur = conn.cursor()
@@ -934,10 +1047,15 @@ def handle_callback(callback):
         )
 
         conn.commit()
+
         cur.close()
         conn.close()
 
-        send_message(chat_id, "✅ Channel removed.")
+        send_message(
+            chat_id,
+            "✅ Channel removed."
+        )
+
         return
 
     if data == "status":
@@ -963,11 +1081,11 @@ def handle_callback(callback):
 def telegram_webhook():
 
     secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token", ""
+        "X-Telegram-Bot-Api-Secret-Token",
+        ""
     )
 
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-
         abort(403)
 
     update = request.get_json(silent=True) or {}
@@ -989,6 +1107,7 @@ def telegram_webhook():
         fresh = cur.fetchone()
 
         conn.commit()
+
         cur.close()
         conn.close()
 
@@ -1007,148 +1126,14 @@ def telegram_webhook():
 
     except Exception:
 
-        logging.exception("Update processing failed")
+        logging.exception(
+            "Update processing failed"
+        )
 
     return jsonify({"ok": True})
 
 
-# ================= WEBPAGE =================
-
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
-<title>AMR CLOUD</title>
-
-<style>
-
-*{
-box-sizing:border-box;
-}
-
-body{
-margin:0;
-background:#080b13;
-color:white;
-font-family:Arial,sans-serif;
-min-height:100vh;
-display:flex;
-align-items:center;
-justify-content:center;
-padding:20px;
-}
-
-.container{
-width:100%;
-max-width:480px;
-background:rgba(255,255,255,.055);
-border:1px solid rgba(255,255,255,.12);
-border-radius:25px;
-padding:28px;
-box-shadow:0 20px 80px rgba(0,0,0,.5);
-backdrop-filter:blur(20px);
-}
-
-.logo{
-font-size:27px;
-font-weight:bold;
-letter-spacing:2px;
-margin-bottom:25px;
-}
-
-.logo span{
-color:#7b83ff;
-}
-
-.file-icon{
-font-size:65px;
-margin-bottom:20px;
-}
-
-h2{
-font-size:22px;
-overflow-wrap:anywhere;
-}
-
-.info{
-color:#a7adbd;
-font-size:14px;
-line-height:1.8;
-margin-bottom:25px;
-}
-
-button{
-width:100%;
-border:0;
-padding:16px;
-border-radius:13px;
-font-size:15px;
-font-weight:bold;
-cursor:pointer;
-margin-top:12px;
-}
-
-.access{
-background:#716cff;
-color:white;
-}
-
-.download{
-background:#171e30;
-border:1px solid #555b78;
-color:white;
-}
-
-.note{
-font-size:12px;
-color:#8e95a8;
-text-align:center;
-margin-top:25px;
-}
-
-</style>
-</head>
-
-<body>
-
-<div class="container">
-
-<div class="logo">AMR <span>CLOUD</span></div>
-
-<div class="file-icon">📁</div>
-
-<h2>{{NAME}}</h2>
-
-<div class="info">
-File Type: {{TYPE}}<br>
-File Size: {{SIZE}}<br>
-Secure File Sharing
-</div>
-
-<form action="/access/{{TOKEN}}" method="POST">
-<button class="access">
-🔓 ACCESS FILE
-</button>
-</form>
-
-<form action="/download/{{TOKEN}}" method="POST">
-<button class="download">
-⬇ DOWNLOAD FILE
-</button>
-</form>
-
-<div class="note">
-AMR CLOUD · Secure File Platform
-</div>
-
-</div>
-
-</body>
-</html>
-"""
-
+# ================= FILE SIZE =================
 
 def format_size(size):
 
@@ -1157,14 +1142,16 @@ def format_size(size):
     if size < 1024:
         return f"{size} B"
 
-    if size < 1024**2:
-        return f"{size/1024:.2f} KB"
+    if size < 1024 ** 2:
+        return f"{size / 1024:.2f} KB"
 
-    if size < 1024**3:
-        return f"{size/(1024**2):.2f} MB"
+    if size < 1024 ** 3:
+        return f"{size / (1024 ** 2):.2f} MB"
 
-    return f"{size/(1024**3):.2f} GB"
+    return f"{size / (1024 ** 3):.2f} GB"
 
+
+# ================= HOME PAGE =================
 
 @app.route("/")
 def home():
@@ -1176,6 +1163,8 @@ def home():
     """
 
 
+# ================= HEALTH =================
+
 @app.route("/health")
 def health():
 
@@ -1184,6 +1173,8 @@ def health():
         "service": "AMR CLOUD"
     })
 
+
+# ================= WEBPAGE =================
 
 @app.route("/file/<token>")
 def file_page(token):
@@ -1202,17 +1193,19 @@ def file_page(token):
     )
 
     conn.commit()
+
     cur.close()
     conn.close()
 
-    html = HTML
-
-    html = html.replace("{{NAME}}", str(file["file_name"]))
-    html = html.replace("{{TYPE}}", str(file["file_type"]))
-    html = html.replace("{{SIZE}}", format_size(file["file_size"]))
-    html = html.replace("{{TOKEN}}", token)
-
-    return html
+    return render_template(
+        "file.html",
+        file={
+            **file,
+            "formatted_size": format_size(
+                file["file_size"]
+            )
+        }
+    )
 
 
 # ================= ACCESS =================
@@ -1277,11 +1270,20 @@ def download_file(token):
         r = requests.get(
             download_url,
             stream=True,
-            timeout=60
+            timeout=(15, 60)
         )
 
         if r.status_code != 200:
+
+            r.close()
+
             return "Download failed.", 502
+
+        filename = re.sub(
+            r'[\r\n"\\\\]',
+            "_",
+            file["file_name"] or "download"
+        )
 
         conn = db()
         cur = conn.cursor()
@@ -1292,27 +1294,45 @@ def download_file(token):
         )
 
         conn.commit()
+
         cur.close()
         conn.close()
 
-        filename = re.sub(
-            r'[\r\n"\\\\]',
-            "_",
-            file["file_name"] or "download"
-        )
+        def generate():
 
-        return Response(
-            r.iter_content(chunk_size=64 * 1024),
+            try:
+
+                for chunk in r.iter_content(
+                    chunk_size=64 * 1024
+                ):
+
+                    if chunk:
+                        yield chunk
+
+            finally:
+
+                r.close()
+
+        response = Response(
+            stream_with_context(generate()),
+            content_type=(
+                file["mime_type"]
+                or "application/octet-stream"
+            ),
             headers={
-                "Content-Type": file["mime_type"],
                 "Content-Disposition":
                     f'attachment; filename="{filename}"'
             }
         )
 
+        return response
+
     except Exception:
 
-        logging.exception("Download error")
+        logging.exception(
+            "Download error"
+        )
+
         return "Download error.", 500
 
 
@@ -1321,15 +1341,26 @@ def download_file(token):
 @app.route("/setup-webhook")
 def setup_webhook():
 
-    secret = request.args.get("secret", "")
+    secret = request.args.get(
+        "secret", ""
+    )
 
     if not UPDATE_SECRET or not secrets.compare_digest(
-        secret, UPDATE_SECRET
+        secret,
+        UPDATE_SECRET
     ):
 
         abort(403)
 
-    webhook_url = f"{BASE_URL}/telegram-webhook"
+    if not BASE_URL:
+        return jsonify({
+            "ok": False,
+            "error": "RENDER_EXTERNAL_URL is missing"
+        }), 500
+
+    webhook_url = (
+        f"{BASE_URL}/telegram-webhook"
+    )
 
     result = tg("setWebhook", {
         "url": webhook_url,
@@ -1344,11 +1375,16 @@ def setup_webhook():
 
 init_db()
 
-logging.info("AMR CLOUD database initialized.")
+logging.info(
+    "AMR CLOUD database initialized."
+)
+
 
 if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
-    )
+        port=int(
+            os.environ.get("PORT", 5000)
+        )
+                         )
