@@ -1,11 +1,17 @@
 import logging
-import secrets
+
 from datetime import datetime, timezone
 
-from pymongo import MongoClient, DESCENDING
-from pymongo.errors import PyMongoError
+from pymongo import (
+    MongoClient,
+    DESCENDING,
+    ReturnDocument
+)
+
+from pymongo.errors import DuplicateKeyError
 
 from config import MONGO_URI, MONGO_DATABASE
+
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +22,8 @@ users = None
 files = None
 settings = None
 force_channels = None
-admin_states = None
-processed_updates = None
+counters = None
+webhook_updates = None
 
 
 def now():
@@ -27,17 +33,16 @@ def now():
 def initialize_database():
     global client, db
     global users, files, settings
-    global force_channels, admin_states, processed_updates
+    global force_channels, counters, webhook_updates
 
     if not MONGO_URI:
-        raise RuntimeError("MONGO_URI is missing")
+        raise RuntimeError("MONGO_URI is missing.")
 
     client = MongoClient(
         MONGO_URI,
         serverSelectionTimeoutMS=10000,
         connectTimeoutMS=10000,
-        socketTimeoutMS=20000,
-        retryWrites=True,
+        retryWrites=True
     )
 
     client.admin.command("ping")
@@ -48,41 +53,46 @@ def initialize_database():
     files = db["files"]
     settings = db["settings"]
     force_channels = db["force_channels"]
-    admin_states = db["admin_states"]
-    processed_updates = db["processed_updates"]
+    counters = db["counters"]
+    webhook_updates = db["webhook_updates"]
 
     users.create_index("telegram_id", unique=True)
 
+    files.create_index("id", unique=True)
     files.create_index("token", unique=True)
-    files.create_index([("uploaded_by", DESCENDING)])
-    files.create_index([("created_at", DESCENDING)])
+    files.create_index("uploaded_by")
+    files.create_index("created_at")
 
     settings.create_index("key", unique=True)
+
+    force_channels.create_index("id", unique=True)
     force_channels.create_index("chat_id", unique=True)
-    admin_states.create_index("admin_id", unique=True)
-    processed_updates.create_index("update_id", unique=True)
+
+    webhook_updates.create_index("update_id", unique=True)
 
     defaults = {
         "start_message": "Welcome to DESI CLOUD!",
-        "about_message": "DESI CLOUD - Your Telegram file storage.",
+        "about_message": "DESI CLOUD - Telegram File Storage.",
         "help_message": "Send a file to upload it to your cloud.",
         "force_join_enabled": False,
         "website_enabled": True,
+        "star_message": ""
     }
 
     for key, value in defaults.items():
         settings.update_one(
             {"key": key},
-            {"$setOnInsert": {
-                "key": key,
-                "value": value,
-                "updated_at": now(),
-            }},
-            upsert=True,
+            {"$setOnInsert": {"value": value}},
+            upsert=True
         )
 
-    logger.info("MongoDB connected and initialized successfully.")
-    return True
+    # Recover updates left in processing state after a restart.
+    webhook_updates.update_many(
+        {"status": "processing"},
+        {"$set": {"status": "pending"}}
+    )
+
+    logger.info("MongoDB initialized successfully.")
 
 
 def close_database():
@@ -90,80 +100,61 @@ def close_database():
 
     if client:
         client.close()
-        client = None
-
-
-def check_database():
-    if client is None:
-        raise RuntimeError("Database is not initialized")
-
-    client.admin.command("ping")
-    return True
 
 
 # ---------------- USERS ----------------
 
-def register_user(user_id, username=None, first_name=None, last_name=None):
+def register_user(user):
+    telegram_id = user.id
+
     users.update_one(
-        {"telegram_id": int(user_id)},
+        {"telegram_id": telegram_id},
         {
             "$set": {
-                "username": username,
-                "first_name": first_name,
-                "last_name": last_name,
-                "last_active": now(),
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "last_active": now()
             },
             "$setOnInsert": {
-                "telegram_id": int(user_id),
+                "telegram_id": telegram_id,
                 "is_banned": False,
-                "joined_at": now(),
-            },
+                "joined_at": now()
+            }
         },
-        upsert=True,
+        upsert=True
     )
+
+
+def get_all_user_ids():
+    return list(
+        users.find(
+            {"is_banned": {"$ne": True}},
+            {"telegram_id": 1, "_id": 0}
+        )
+    )
+
+
+def get_users_paginated(page=0, per_page=10):
+    skip = page * per_page
+
+    return list(
+        users.find()
+        .sort("joined_at", DESCENDING)
+        .skip(skip)
+        .limit(per_page)
+    )
+
+
+def count_users():
+    return users.count_documents({})
 
 
 def get_user(user_id):
     return users.find_one({"telegram_id": int(user_id)})
 
 
-def get_total_users():
-    return users.count_documents({})
-
-
-def get_all_user_ids():
-    return [
-        item["telegram_id"]
-        for item in users.find(
-            {"is_banned": {"$ne": True}},
-            {"telegram_id": 1},
-        )
-    ]
-
-
-def ban_user(user_id):
-    users.update_one(
-        {"telegram_id": int(user_id)},
-        {"$set": {"is_banned": True}},
-    )
-
-
-def unban_user(user_id):
-    users.update_one(
-        {"telegram_id": int(user_id)},
-        {"$set": {"is_banned": False}},
-    )
-
-
 # ---------------- FILES ----------------
-
-def generate_token():
-    while True:
-        token = secrets.token_urlsafe(12)
-
-        if not files.find_one({"token": token}):
-            return token
-
 
 def save_file(
     token,
@@ -173,248 +164,293 @@ def save_file(
     file_size,
     mime_type,
     caption,
-    uploaded_by,
+    uploaded_by
 ):
+    next_id = counters.find_one_and_update(
+        {"_id": "files"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+
     document = {
+        "id": next_id["value"],
         "token": token,
         "file_id": file_id,
         "file_type": file_type,
         "file_name": file_name,
-        "file_size": int(file_size or 0),
+        "file_size": file_size or 0,
         "mime_type": mime_type,
-        "caption": caption,
+        "caption": caption or "",
         "uploaded_by": int(uploaded_by),
         "views": 0,
         "downloads": 0,
         "is_public": False,
         "sharing_enabled": True,
         "created_at": now(),
-        "updated_at": now(),
+        "updated_at": now()
     }
 
     files.insert_one(document)
+
     return document
+
+
+def get_file_by_id(file_id):
+    return files.find_one({"id": int(file_id)})
 
 
 def get_file_by_token(token):
     return files.find_one({"token": token})
 
 
-def get_file_by_id(file_id):
-    return files.find_one({"_id": file_id})
-
-
-def get_user_file(token, user_id):
+def get_user_file(file_id, user_id):
     return files.find_one({
-        "token": token,
-        "uploaded_by": int(user_id),
+        "id": int(file_id),
+        "uploaded_by": int(user_id)
     })
 
 
-def get_user_files(user_id, limit=20, skip=0):
+def get_user_files(user_id, page=0, per_page=8):
     return list(
         files.find({"uploaded_by": int(user_id)})
         .sort("created_at", DESCENDING)
-        .skip(skip)
-        .limit(limit)
+        .skip(page * per_page)
+        .limit(per_page)
     )
 
 
 def count_user_files(user_id):
-    return files.count_documents({"uploaded_by": int(user_id)})
+    return files.count_documents({
+        "uploaded_by": int(user_id)
+    })
 
 
-def increment_file_views(token):
-    files.update_one(
-        {"token": token},
-        {"$inc": {"views": 1}},
+def get_all_files(page=0, per_page=10):
+    return list(
+        files.find()
+        .sort("created_at", DESCENDING)
+        .skip(page * per_page)
+        .limit(per_page)
     )
 
 
-def increment_file_downloads(token):
-    files.update_one(
-        {"token": token},
-        {"$inc": {"downloads": 1}},
+def count_all_files():
+    return files.count_documents({})
+
+
+def increment_file_views(file_id):
+    return files.update_one(
+        {"id": int(file_id)},
+        {"$inc": {"views": 1}}
     )
 
 
-def rename_file(token, user_id, new_name):
-    result = files.update_one(
+def increment_file_downloads(file_id):
+    return files.update_one(
+        {"id": int(file_id)},
+        {"$inc": {"downloads": 1}}
+    )
+
+
+def rename_file(file_id, user_id, new_name):
+    return files.update_one(
         {
-            "token": token,
-            "uploaded_by": int(user_id),
+            "id": int(file_id),
+            "uploaded_by": int(user_id)
         },
         {
             "$set": {
                 "file_name": new_name,
-                "updated_at": now(),
+                "updated_at": now()
             }
-        },
-    )
-
-    return result.modified_count > 0
+        }
+    ).modified_count > 0
 
 
-def delete_file(token, user_id):
-    result = files.delete_one({
-        "token": token,
-        "uploaded_by": int(user_id),
-    })
-
-    return result.deleted_count > 0
+def delete_file(file_id, user_id):
+    return files.delete_one({
+        "id": int(file_id),
+        "uploaded_by": int(user_id)
+    }).deleted_count > 0
 
 
-def set_file_sharing(token, user_id, enabled):
-    result = files.update_one(
+def admin_delete_file(file_id):
+    return files.delete_one({
+        "id": int(file_id)
+    }).deleted_count > 0
+
+
+def set_file_sharing(file_id, user_id, enabled):
+    return files.update_one(
         {
-            "token": token,
-            "uploaded_by": int(user_id),
+            "id": int(file_id),
+            "uploaded_by": int(user_id)
         },
         {
             "$set": {
                 "sharing_enabled": bool(enabled),
-                "updated_at": now(),
+                "is_public": bool(enabled),
+                "updated_at": now()
             }
-        },
-    )
-
-    return result.modified_count > 0
+        }
+    ).modified_count > 0
 
 
-def regenerate_file_token(token, user_id):
-    new_token = generate_token()
-
-    result = files.update_one(
-        {
-            "token": token,
-            "uploaded_by": int(user_id),
-        },
-        {
-            "$set": {
-                "token": new_token,
-                "updated_at": now(),
-            }
-        },
-    )
-
-    return new_token if result.modified_count else None
-
-
-def get_recent_files(limit=10):
-    return list(
-        files.find()
-        .sort("created_at", DESCENDING)
-        .limit(limit)
-    )
-
-
-def get_total_files():
-    return files.count_documents({})
-
-
-def get_total_views():
-    result = files.aggregate([
-        {"$group": {"_id": None, "total": {"$sum": "$views"}}}
-    ])
-
-    result = list(result)
-    return result[0]["total"] if result else 0
-
-
-def get_total_downloads():
-    result = files.aggregate([
-        {"$group": {"_id": None, "total": {"$sum": "$downloads"}}}
-    ])
-
-    result = list(result)
-    return result[0]["total"] if result else 0
+def get_public_file(token):
+    return files.find_one({
+        "token": token,
+        "sharing_enabled": True,
+        "is_public": True
+    })
 
 
 # ---------------- SETTINGS ----------------
 
 def get_setting(key, default=None):
-    item = settings.find_one({"key": key})
-    return item["value"] if item else default
+    result = settings.find_one({"key": key})
+
+    if not result:
+        return default
+
+    return result.get("value", default)
 
 
 def set_setting(key, value):
     settings.update_one(
         {"key": key},
-        {
-            "$set": {
-                "value": value,
-                "updated_at": now(),
-            }
-        },
-        upsert=True,
+        {"$set": {"value": value}},
+        upsert=True
     )
 
 
 # ---------------- FORCE JOIN ----------------
 
 def add_force_channel(chat_id, channel_username=None, channel_title=None):
-    force_channels.update_one(
-        {"chat_id": str(chat_id)},
-        {
-            "$set": {
-                "channel_username": channel_username,
-                "channel_title": channel_title,
-                "is_active": True,
-                "updated_at": now(),
-            },
-            "$setOnInsert": {"added_at": now()},
-        },
+    next_id = counters.find_one_and_update(
+        {"_id": "force_channels"},
+        {"$inc": {"value": 1}},
         upsert=True,
+        return_document=ReturnDocument.AFTER
     )
+
+    document = {
+        "id": next_id["value"],
+        "chat_id": int(chat_id),
+        "channel_username": channel_username,
+        "channel": channel_username or str(chat_id),
+        "channel_title": channel_title or "",
+        "created_at": now()
+    }
+
+    try:
+        force_channels.insert_one(document)
+        return document
+    except DuplicateKeyError:
+        return force_channels.find_one({"chat_id": int(chat_id)})
 
 
 def get_force_channels():
-    return list(force_channels.find({"is_active": True}))
+    return list(force_channels.find().sort("id", DESCENDING))
 
 
-def remove_force_channel(chat_id):
-    result = force_channels.delete_one({"chat_id": str(chat_id)})
-    return result.deleted_count > 0
+def remove_force_channel(channel_id):
+    return force_channels.delete_one({
+        "id": int(channel_id)
+    }).deleted_count > 0
 
 
-# ---------------- ADMIN STATES ----------------
+# ---------------- ADMIN STATISTICS ----------------
 
-def set_admin_state(admin_id, state, data=None):
-    admin_states.update_one(
-        {"admin_id": int(admin_id)},
+def get_statistics():
+    total_users = users.count_documents({})
+    total_files = files.count_documents({})
+
+    pipeline = [{
+        "$group": {
+            "_id": None,
+            "views": {"$sum": "$views"},
+            "downloads": {"$sum": "$downloads"},
+            "storage": {"$sum": "$file_size"}
+        }
+    }]
+
+    result = list(files.aggregate(pipeline))
+
+    totals = result[0] if result else {}
+
+    return {
+        "total_users": total_users,
+        "total_files": total_files,
+        "total_views": totals.get("views", 0),
+        "total_downloads": totals.get("downloads", 0),
+        "total_storage": totals.get("storage", 0),
+        "shared_files": files.count_documents({
+            "sharing_enabled": True,
+            "is_public": True
+        }),
+        "disabled_files": files.count_documents({
+            "sharing_enabled": False
+        }),
+        "total_channels": force_channels.count_documents({})
+    }
+
+
+def get_public_statistics():
+    stats = get_statistics()
+
+    return {
+        "total_files": stats["total_files"],
+        "total_users": stats["total_users"],
+        "total_views": stats["total_views"],
+        "total_downloads": stats["total_downloads"]
+    }
+
+
+# ---------------- WEBHOOK QUEUE ----------------
+
+def save_webhook_update(update_id, payload):
+    try:
+        webhook_updates.insert_one({
+            "update_id": int(update_id),
+            "payload": payload,
+            "status": "pending",
+            "attempts": 0,
+            "created_at": now()
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+def claim_webhook_update():
+    return webhook_updates.find_one_and_update(
+        {"status": "pending"},
         {
             "$set": {
-                "state": state,
-                "data": data or {},
-                "updated_at": now(),
-            }
+                "status": "processing",
+                "processing_at": now()
+            },
+            "$inc": {"attempts": 1}
         },
-        upsert=True,
+        sort=[("created_at", 1)],
+        return_document=ReturnDocument.AFTER
     )
 
 
-def get_admin_state(admin_id):
-    return admin_states.find_one({"admin_id": int(admin_id)})
+def complete_webhook_update(update_id):
+    webhook_updates.delete_one({
+        "update_id": int(update_id)
+    })
 
 
-def clear_admin_state(admin_id):
-    admin_states.delete_one({"admin_id": int(admin_id)})
-
-
-# ---------------- UPDATE PROTECTION ----------------
-
-def is_update_processed(update_id):
-    return processed_updates.find_one(
-        {"update_id": int(update_id)}
-    ) is not None
-
-
-def mark_update_processed(update_id):
-    try:
-        processed_updates.insert_one({
-            "update_id": int(update_id),
-            "processed_at": now(),
-        })
-        return True
-    except PyMongoError:
-        return False
+def retry_webhook_update(update_id, error=None):
+    webhook_updates.update_one(
+        {"update_id": int(update_id)},
+        {
+            "$set": {
+                "status": "pending",
+                "last_error": str(error or "")[:1000]
+            }
+        }
+    )
