@@ -1,155 +1,72 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#080b14">
 
-    <title>{{ file.file_name }} | VIRAL5X CLOUD</title>
+    <title>DESHI CLOUD</title>
 
-    <link rel="stylesheet"
-          href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 
 <body>
 
-<div class="background">
-    <div class="orb orb1"></div>
-    <div class="orb orb2"></div>
-</div>
+    <header>
+        <div class="logo">☁️ DESHI CLOUD</div>
+        <a href="https://t.me/YOUR_BOT_USERNAME" class="button">
+            Open Bot
+        </a>
+    </header>
 
-<header class="navbar">
+    <main>
 
-    <a href="/" class="logo">
-        <span class="logo-icon">A</span>
-        <span>AMR <b>CLOUD</b></span>
-    </a>
+        <section class="hero">
 
-    <div class="secure">
-        <span></span> SECURE STORAGE
-    </div>
+            <div class="badge">PERSONAL TELEGRAM CLOUD</div>
 
-</header>
+            <h1>
+                Your Files.<br>
+                Your Cloud.
+            </h1>
 
-<main class="main">
+            <p>
+                Share and access your files easily with
+                DESHI CLOUD Telegram Bot.
+            </p>
 
-    <section class="card">
+            <a href="https://t.me/YOUR_BOT_USERNAME" class="main-button">
+                Get Started →
+            </a>
 
-        <div class="badge">
-            <span></span> FILE AVAILABLE
-        </div>
+        </section>
 
-        <div class="file-icon" id="fileIcon">
-            📁
-        </div>
+        <section class="features">
 
-        <h1>{{ file.file_name }}</h1>
-
-        <p class="subtitle">
-            Your file is ready to access.
-        </p>
-
-        <div class="file-info">
-
-            <div class="info-box">
-                <small>FILE TYPE</small>
-                <strong>{{ file.file_type }}</strong>
+            <div class="card">
+                <h2>📁</h2>
+                <h3>File Sharing</h3>
+                <p>Share documents, videos and photos.</p>
             </div>
 
-            <div class="info-box">
-                <small>FILE SIZE</small>
-                <strong>{{ file.formatted_size }}</strong>
+            <div class="card">
+                <h2>🔐</h2>
+                <h3>Secure Links</h3>
+                <p>Access files through unique sharing links.</p>
             </div>
 
-        </div>
-
-        <div class="divider"></div>
-
-        <!-- ACCESS SECTION -->
-
-        <div class="section-heading">
-            <div class="number">01</div>
-
-            <div>
-                <h3>Access Your File</h3>
-                <p>Continue to the file access page.</p>
+            <div class="card">
+                <h2>⚡</h2>
+                <h3>Fast Access</h3>
+                <p>Receive shared files directly on Telegram.</p>
             </div>
-        </div>
 
-        <!-- Ad placement 1 -->
-        <div class="ad-container">
-            <span class="ad-label">ADVERTISEMENT</span>
+        </section>
 
-            <div class="ad-slot">
-                Ad Placement 1
-            </div>
-        </div>
-
-        <!-- Ad placement 2 -->
-        <div class="ad-container">
-            <span class="ad-label">ADVERTISEMENT</span>
-
-            <div class="ad-slot">
-                Ad Placement 2
-            </div>
-        </div>
-
-        <form action="/access/{{ file.token }}" method="POST">
-
-            <button class="btn access-btn" type="submit">
-                <span>ACCESS WITH 2 ADS</span>
-                <span>↗</span>
-            </button>
-
-        </form>
-
-        <!-- DOWNLOAD SECTION -->
-
-        <div class="divider"></div>
-
-        <div class="section-heading">
-            <div class="number">02</div>
-
-            <div>
-                <h3>Download Your File</h3>
-                <p>Download the original file.</p>
-            </div>
-        </div>
-
-        <!-- Ad placement 3 -->
-        <div class="ad-container">
-            <span class="ad-label">ADVERTISEMENT</span>
-
-            <div class="ad-slot">
-                Download Ad Placement
-            </div>
-        </div>
-
-        <form action="/download/{{ file.token }}"
-              method="POST"
-              id="downloadForm">
-
-            <button class="btn download-btn" type="submit">
-                <span>DOWNLOAD WITH 1 AD</span>
-                <span>↓</span>
-            </button>
-
-        </form>
-
-        <div class="footer-note">
-            🔒 Secure file delivery by VIRAL5X CLOUD
-        </div>
-
-    </section>
+    </main>
 
     <footer>
-        © 2026 AMR CLOUD · All Rights Reserved
+        © 2026 DESHI CLOUD. All rights reserved.
     </footer>
-
-</main>
-
-<script src="{{ url_for('static', filename='script.js') }}"></script>
 
 </body>
 </html>
