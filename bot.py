@@ -4,9 +4,10 @@ import uuid
 import asyncio
 import logging
 import threading
-import queue
 import html
 import time
+import re
+from contextlib import suppress
 
 import psycopg2
 import psycopg2.extras
@@ -50,6 +51,10 @@ WEBHOOK_PATH = "/telegram-webhook"
 
 PORT = int(os.getenv("PORT", "10000"))
 
+STARTUP_RETRY_SECONDS = 10
+
+WEBHOOK_PROCESS_TIMEOUT = 50
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
@@ -61,6 +66,12 @@ if not ADMIN_ID:
 
 if not RENDER_EXTERNAL_URL:
     raise RuntimeError("RENDER_EXTERNAL_URL is missing")
+
+if WEBHOOK_SECRET and not re.fullmatch(
+    r"[A-Za-z0-9_-]{1,256}",
+    WEBHOOK_SECRET
+):
+    raise RuntimeError("Invalid WEBHOOK_SECRET format")
 
 
 # =========================================================
@@ -74,6 +85,16 @@ logging.basicConfig(
 
 logger = logging.getLogger("AMR_CLOUD")
 
+# Avoid logging HTTP request URLs containing bot tokens.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.INFO)
+
+
+# =========================================================
+# FLASK AND BOT GLOBALS
+# =========================================================
+
 app = Flask(__name__)
 
 bot_application = None
@@ -84,12 +105,13 @@ bot_ready = threading.Event()
 
 bot_start_error = None
 
-# Updates received during startup are stored here.
-update_queue = queue.Queue(maxsize=500)
+startup_lock = threading.Lock()
+
+bot_thread = None
 
 
 # =========================================================
-# DATABASE CONNECTION
+# DATABASE
 # =========================================================
 
 def db_execute(
@@ -112,7 +134,10 @@ def db_execute(
                 cursor_factory=psycopg2.extras.RealDictCursor
             ) as cursor:
 
-                cursor.execute(query, params or ())
+                cursor.execute(
+                    query,
+                    params or ()
+                )
 
                 if fetchone:
                     return cursor.fetchone()
@@ -123,6 +148,7 @@ def db_execute(
                 return None
 
     finally:
+
         connection.close()
 
 
@@ -134,64 +160,118 @@ def init_db():
 
     logger.info("Initializing AMR CLOUD database...")
 
+    # USERS
+
     db_execute("""
         CREATE TABLE IF NOT EXISTS users (
+
             user_id BIGINT PRIMARY KEY,
+
             username TEXT,
+
             first_name TEXT,
+
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
         )
     """)
+
+    # FILES
 
     db_execute("""
         CREATE TABLE IF NOT EXISTS files (
+
             id SERIAL PRIMARY KEY,
+
             token TEXT UNIQUE NOT NULL,
+
             file_id TEXT NOT NULL,
+
             file_type TEXT NOT NULL,
+
             file_name TEXT,
+
             caption TEXT,
+
             views INTEGER DEFAULT 0,
+
             uploaded_by BIGINT,
+
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
         )
     """)
+
+    # FORCE JOIN
 
     db_execute("""
         CREATE TABLE IF NOT EXISTS force_channels (
+
             id SERIAL PRIMARY KEY,
+
             channel TEXT UNIQUE NOT NULL
+
         )
     """)
+
+    # SETTINGS
 
     db_execute("""
         CREATE TABLE IF NOT EXISTS settings (
+
             key TEXT PRIMARY KEY,
+
             value TEXT
+
         )
     """)
 
-    # Separate state table avoids legacy schema conflicts.
+    # NEW ADMIN STATES TABLE
+    # Existing legacy admin_states table is untouched.
 
     db_execute("""
         CREATE TABLE IF NOT EXISTS amr_admin_states (
+
             admin_id BIGINT PRIMARY KEY,
+
             state TEXT,
+
             data JSONB NOT NULL DEFAULT '{}'::jsonb,
+
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
         )
     """)
 
+    # Ensure data column exists.
+
     db_execute("""
         ALTER TABLE amr_admin_states
+
         ADD COLUMN IF NOT EXISTS data JSONB
+
         NOT NULL DEFAULT '{}'::jsonb
     """)
 
+    # Ensure updated_at exists.
+
+    db_execute("""
+        ALTER TABLE amr_admin_states
+
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP
+
+        DEFAULT CURRENT_TIMESTAMP
+    """)
+
+    # PROCESSED UPDATES
+
     db_execute("""
         CREATE TABLE IF NOT EXISTS processed_updates (
+
             update_id BIGINT PRIMARY KEY,
+
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
         )
     """)
 
@@ -206,6 +286,7 @@ def set_state(admin_id, state, data=None):
 
     db_execute("""
         INSERT INTO amr_admin_states
+
         (admin_id, state, data, updated_at)
 
         VALUES (%s, %s, %s::jsonb, CURRENT_TIMESTAMP)
@@ -213,9 +294,13 @@ def set_state(admin_id, state, data=None):
         ON CONFLICT (admin_id)
 
         DO UPDATE SET
+
             state = EXCLUDED.state,
+
             data = EXCLUDED.data,
+
             updated_at = CURRENT_TIMESTAMP
+
     """, (
         int(admin_id),
         state,
@@ -227,9 +312,14 @@ def get_state(admin_id):
 
     row = db_execute("""
         SELECT state, data
+
         FROM amr_admin_states
+
         WHERE admin_id = %s
-    """, (int(admin_id),), fetchone=True)
+
+    """, (
+        int(admin_id),
+    ), fetchone=True)
 
     if not row:
         return None, {}
@@ -241,8 +331,12 @@ def clear_state(admin_id):
 
     db_execute("""
         DELETE FROM amr_admin_states
+
         WHERE admin_id = %s
-    """, (int(admin_id),))
+
+    """, (
+        int(admin_id),
+    ))
 
 
 # =========================================================
@@ -252,23 +346,34 @@ def clear_state(admin_id):
 def set_setting(key, value):
 
     db_execute("""
-        INSERT INTO settings (key, value)
+        INSERT INTO settings
+
+        (key, value)
 
         VALUES (%s, %s)
 
         ON CONFLICT (key)
 
         DO UPDATE SET value = EXCLUDED.value
-    """, (key, str(value)))
+
+    """, (
+        key,
+        str(value)
+    ))
 
 
 def get_setting(key, default=""):
 
     row = db_execute("""
         SELECT value
+
         FROM settings
+
         WHERE key = %s
-    """, (key,), fetchone=True)
+
+    """, (
+        key,
+    ), fetchone=True)
 
     return row["value"] if row else default
 
@@ -284,6 +389,7 @@ def save_user(user):
 
     db_execute("""
         INSERT INTO users
+
         (user_id, username, first_name)
 
         VALUES (%s, %s, %s)
@@ -291,8 +397,11 @@ def save_user(user):
         ON CONFLICT (user_id)
 
         DO UPDATE SET
+
             username = EXCLUDED.username,
+
             first_name = EXCLUDED.first_name
+
     """, (
         user.id,
         user.username,
@@ -304,7 +413,9 @@ def get_users():
 
     return db_execute("""
         SELECT user_id
+
         FROM users
+
     """, fetchall=True)
 
 
@@ -424,11 +535,17 @@ def get_channels():
 
     rows = db_execute("""
         SELECT channel
+
         FROM force_channels
+
         ORDER BY id ASC
+
     """, fetchall=True)
 
-    return [row["channel"] for row in rows]
+    return [
+        row["channel"]
+        for row in rows
+    ]
 
 
 def join_keyboard(channels):
@@ -474,6 +591,7 @@ async def check_join(user_id, context):
             )
 
             if member.status in ("left", "kicked"):
+
                 return False
 
         except Exception:
@@ -504,6 +622,7 @@ def save_file(
 
     db_execute("""
         INSERT INTO files
+
         (
             token,
             file_id,
@@ -514,6 +633,7 @@ def save_file(
         )
 
         VALUES (%s, %s, %s, %s, %s, %s)
+
     """, (
         token,
         file_id,
@@ -530,18 +650,27 @@ def get_file(token):
 
     return db_execute("""
         SELECT *
+
         FROM files
+
         WHERE token = %s
-    """, (token,), fetchone=True)
+
+    """, (
+        token,
+    ), fetchone=True)
 
 
 def get_file_list():
 
     return db_execute("""
         SELECT *
+
         FROM files
+
         ORDER BY id DESC
+
         LIMIT 30
+
     """, fetchall=True)
 
 
@@ -549,14 +678,21 @@ def delete_file(token):
 
     db_execute("""
         DELETE FROM files
+
         WHERE token = %s
-    """, (token,))
+
+    """, (
+        token,
+    ))
 
 
 def file_link(token):
 
     if not bot_username:
-        raise RuntimeError("Bot username is not ready")
+
+        raise RuntimeError(
+            "Bot username is not ready"
+        )
 
     return (
         f"https://t.me/{bot_username}"
@@ -581,17 +717,10 @@ async def send_file(update, context, token):
 
     if not file:
 
-        if update.message:
-
-            await update.message.reply_text(
-                "❌ File not found."
-            )
-
-        elif update.callback_query:
-
-            await update.callback_query.message.reply_text(
-                "❌ File not found."
-            )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ File not found."
+        )
 
         return
 
@@ -606,14 +735,15 @@ async def send_file(update, context, token):
 
         if not joined:
 
-            message = update.effective_message
+            await context.bot.send_message(
+                chat_id=user_id,
 
-            if message:
+                text=(
+                    "🔒 Join all required channels first."
+                ),
 
-                await message.reply_text(
-                    "🔒 Join all required channels first.",
-                    reply_markup=join_keyboard(channels)
-                )
+                reply_markup=join_keyboard(channels)
+            )
 
             return
 
@@ -660,13 +790,20 @@ async def send_file(update, context, token):
 
         db_execute("""
             UPDATE files
+
             SET views = views + 1
+
             WHERE token = %s
-        """, (token,))
+
+        """, (
+            token,
+        ))
 
     except Exception:
 
-        logger.exception("File delivery failed")
+        logger.exception(
+            "File delivery failed"
+        )
 
         await context.bot.send_message(
             chat_id=user_id,
@@ -687,6 +824,8 @@ async def start(update, context):
 
     save_user(user)
 
+    # FILE DEEP LINK
+
     if context.args:
 
         argument = context.args[0]
@@ -703,6 +842,8 @@ async def start(update, context):
 
             return
 
+    # FORCE JOIN
+
     channels = get_channels()
 
     if channels:
@@ -715,15 +856,21 @@ async def start(update, context):
         if not joined:
 
             await update.message.reply_text(
+
                 "🔒 Welcome to AMR CLOUD!\n\n"
                 "Join our channels to continue.",
+
                 reply_markup=join_keyboard(channels)
+
             )
 
             return
 
+    # START MESSAGE
+
     message = get_setting(
         "start_message",
+
         "☁️ Welcome to AMR CLOUD!\n\n"
         "Your files, securely accessible."
     )
@@ -752,6 +899,7 @@ async def admin_command(update, context):
 
     await update.message.reply_text(
         "⚙️ AMR CLOUD ADMIN PANEL",
+
         reply_markup=admin_keyboard()
     )
 
@@ -769,6 +917,7 @@ async def cancel(update, context):
 
     await update.message.reply_text(
         "❌ Operation cancelled.",
+
         reply_markup=admin_keyboard()
     )
 
@@ -785,11 +934,13 @@ async def callback_handler(update, context):
         return
 
     user_id = query.from_user.id
+
     action = query.data or ""
 
-    # Admin-only actions must be checked before answering.
+    # ADMIN SECURITY
 
     admin_actions = (
+
         "admin",
         "upload",
         "files",
@@ -801,12 +952,17 @@ async def callback_handler(update, context):
         "add_channel",
         "remove_channel",
         "close",
+
     )
 
     is_admin_action = (
+
         action in admin_actions
+
         or action.startswith("share_")
+
         or action.startswith("delete_")
+
     )
 
     if is_admin_action and not is_admin(user_id):
@@ -854,6 +1010,7 @@ async def callback_handler(update, context):
 
         message = get_setting(
             "star_message",
+
             "⭐ Welcome to AMR CLOUD!\n\n"
             "Thank you for using our service."
         )
@@ -881,6 +1038,7 @@ async def callback_handler(update, context):
 
         await query.message.reply_text(
             "⚙️ AMR CLOUD ADMIN PANEL",
+
             reply_markup=admin_keyboard()
         )
 
@@ -889,9 +1047,12 @@ async def callback_handler(update, context):
         set_state(ADMIN_ID, "upload")
 
         await query.message.reply_text(
+
             "📤 Send a document, video or photo.\n\n"
             "Use /cancel to cancel.",
+
             reply_markup=back_keyboard()
+
         )
 
     elif action == "files":
@@ -901,8 +1062,11 @@ async def callback_handler(update, context):
         if not files:
 
             await query.message.reply_text(
+
                 "📁 No files uploaded yet.",
+
                 reply_markup=back_keyboard()
+
             )
 
             return
@@ -932,10 +1096,13 @@ async def callback_handler(update, context):
             ])
 
             await query.message.reply_text(
+
                 f"📁 {name}\n"
                 f"👁 Views: {file['views']}\n"
                 f"🆔 {file['token']}",
+
                 reply_markup=keyboard
+
             )
 
     elif action.startswith("share_"):
@@ -951,9 +1118,12 @@ async def callback_handler(update, context):
             return
 
         await query.message.reply_text(
+
             "🔗 SHARE LINK\n\n"
             f"{file_link(token)}",
+
             reply_markup=back_keyboard()
+
         )
 
     elif action.startswith("delete_"):
@@ -971,8 +1141,11 @@ async def callback_handler(update, context):
         delete_file(token)
 
         await query.message.reply_text(
+
             "✅ File deleted.",
+
             reply_markup=back_keyboard()
+
         )
 
     elif action == "broadcast":
@@ -980,8 +1153,10 @@ async def callback_handler(update, context):
         set_state(ADMIN_ID, "broadcast")
 
         await query.message.reply_text(
+
             "📢 Send the message to broadcast.\n\n"
             "Use /cancel to cancel."
+
         )
 
     elif action == "start_message":
@@ -1007,8 +1182,11 @@ async def callback_handler(update, context):
         text = "🔐 FORCE JOIN CHANNELS\n\n"
 
         if channels:
+
             text += "\n".join(channels)
+
         else:
+
             text += "No channels added."
 
         keyboard = InlineKeyboardMarkup([
@@ -1046,8 +1224,10 @@ async def callback_handler(update, context):
         set_state(ADMIN_ID, "add_channel")
 
         await query.message.reply_text(
+
             "Send public channel username.\n\n"
             "Example: @MyChannel"
+
         )
 
     elif action == "remove_channel":
@@ -1062,29 +1242,43 @@ async def callback_handler(update, context):
 
         users = db_execute("""
             SELECT COUNT(*) AS total
+
             FROM users
+
         """, fetchone=True)
 
         files = db_execute("""
             SELECT COUNT(*) AS total
+
             FROM files
+
         """, fetchone=True)
 
         views = db_execute("""
             SELECT COALESCE(SUM(views), 0) AS total
+
             FROM files
+
         """, fetchone=True)
 
         text = (
+
             "📊 AMR CLOUD STATISTICS\n\n"
+
             f"👥 Users: {users['total']}\n"
+
             f"📁 Files: {files['total']}\n"
+
             f"👁 Total Views: {views['total']}"
+
         )
 
         await query.message.reply_text(
+
             text,
+
             reply_markup=back_keyboard()
+
         )
 
     elif action == "close":
@@ -1111,6 +1305,7 @@ async def message_handler(update, context):
     if not is_admin(user.id):
 
         save_user(user)
+
         return
 
     state, data = get_state(ADMIN_ID)
@@ -1125,7 +1320,9 @@ async def message_handler(update, context):
     if state == "upload":
 
         file_id = None
+
         file_type = None
+
         file_name = None
 
         caption = message.caption or ""
@@ -1133,6 +1330,7 @@ async def message_handler(update, context):
         if message.document:
 
             file_id = message.document.file_id
+
             file_type = "document"
 
             file_name = (
@@ -1143,6 +1341,7 @@ async def message_handler(update, context):
         elif message.video:
 
             file_id = message.video.file_id
+
             file_type = "video"
 
             file_name = (
@@ -1153,7 +1352,9 @@ async def message_handler(update, context):
         elif message.photo:
 
             file_id = message.photo[-1].file_id
+
             file_type = "photo"
+
             file_name = "Photo"
 
         else:
@@ -1165,20 +1366,31 @@ async def message_handler(update, context):
             return
 
         token = save_file(
+
             file_id,
+
             file_type,
+
             file_name,
+
             caption,
+
             ADMIN_ID
+
         )
 
         clear_state(ADMIN_ID)
 
         await message.reply_text(
+
             "✅ FILE UPLOADED!\n\n"
+
             f"📁 Name: {file_name}\n\n"
+
             f"🔗 Share Link:\n{file_link(token)}",
+
             reply_markup=admin_keyboard()
+
         )
 
     # -----------------------------------------------------
@@ -1197,13 +1409,19 @@ async def message_handler(update, context):
 
             return
 
-        set_setting("start_message", text)
+        set_setting(
+            "start_message",
+            text
+        )
 
         clear_state(ADMIN_ID)
 
         await message.reply_text(
+
             "✅ Start Message updated.",
+
             reply_markup=admin_keyboard()
+
         )
 
     # -----------------------------------------------------
@@ -1222,13 +1440,19 @@ async def message_handler(update, context):
 
             return
 
-        set_setting("star_message", text)
+        set_setting(
+            "star_message",
+            text
+        )
 
         clear_state(ADMIN_ID)
 
         await message.reply_text(
+
             "⭐ Star Message updated.",
+
             reply_markup=admin_keyboard()
+
         )
 
     # -----------------------------------------------------
@@ -1237,24 +1461,33 @@ async def message_handler(update, context):
 
     elif state == "add_channel":
 
-        channel = (message.text or "").strip()
+        channel = (
+            message.text or ""
+        ).strip()
 
         if not channel.startswith("@"):
 
             await message.reply_text(
+
                 "❌ Use public username.\n"
                 "Example: @MyChannel"
+
             )
 
             return
 
         try:
 
-            chat = await context.bot.get_chat(channel)
+            chat = await context.bot.get_chat(
+                channel
+            )
 
             member = await context.bot.get_chat_member(
+
                 chat.id,
+
                 context.bot.id
+
             )
 
             if member.status not in (
@@ -1274,22 +1507,32 @@ async def message_handler(update, context):
                 VALUES (%s)
 
                 ON CONFLICT (channel) DO NOTHING
-            """, (channel,))
+
+            """, (
+                channel,
+            ))
 
             clear_state(ADMIN_ID)
 
             await message.reply_text(
+
                 "✅ Force Join channel added.",
+
                 reply_markup=admin_keyboard()
+
             )
 
         except Exception:
 
-            logger.exception("Unable to add channel")
+            logger.exception(
+                "Unable to add channel"
+            )
 
             await message.reply_text(
+
                 "❌ Cannot access this channel. "
                 "Check username and bot admin permissions."
+
             )
 
     # -----------------------------------------------------
@@ -1298,18 +1541,27 @@ async def message_handler(update, context):
 
     elif state == "remove_channel":
 
-        channel = (message.text or "").strip()
+        channel = (
+            message.text or ""
+        ).strip()
 
         db_execute("""
             DELETE FROM force_channels
+
             WHERE channel = %s
-        """, (channel,))
+
+        """, (
+            channel,
+        ))
 
         clear_state(ADMIN_ID)
 
         await message.reply_text(
+
             "✅ Channel removed.",
+
             reply_markup=admin_keyboard()
+
         )
 
     # -----------------------------------------------------
@@ -1323,10 +1575,13 @@ async def message_handler(update, context):
         users = get_users()
 
         sent = 0
+
         failed = 0
 
         await message.reply_text(
+
             f"📢 Broadcasting to {len(users)} users..."
+
         )
 
         for row in users:
@@ -1351,10 +1606,15 @@ async def message_handler(update, context):
             await asyncio.sleep(0.05)
 
         await message.reply_text(
+
             "✅ BROADCAST COMPLETED\n\n"
+
             f"✔️ Sent: {sent}\n"
+
             f"❌ Failed: {failed}",
+
             reply_markup=admin_keyboard()
+
         )
 
 
@@ -1371,53 +1631,206 @@ async def error_handler(update, context):
 
 
 # =========================================================
-# UPDATE QUEUE WORKER
+# PROCESS WEBHOOK UPDATE
 # =========================================================
 
-async def update_worker():
+async def process_webhook_update(raw_data):
 
-    logger.info("Update queue worker started.")
+    if not bot_application:
+
+        raise RuntimeError(
+            "Telegram application is not initialized"
+        )
+
+    update = Update.de_json(
+        raw_data,
+        bot_application.bot
+    )
+
+    if update:
+
+        await bot_application.process_update(
+            update
+        )
+
+
+# =========================================================
+# BOT STARTUP AND RETRY
+# =========================================================
+
+async def bot_startup_supervisor():
+
+    global bot_application
+    global bot_username
+    global bot_start_error
 
     while True:
 
-        raw_data = await asyncio.to_thread(
-            update_queue.get
-        )
+        application = None
 
         try:
 
-            update = Update.de_json(
-                raw_data,
-                bot_application.bot
+            logger.info(
+                "Creating Telegram application..."
             )
 
-            if update:
+            application = (
+                Application.builder()
+                .token(BOT_TOKEN)
+                .build()
+            )
 
-                await bot_application.process_update(
-                    update
+            # Register handlers.
+
+            application.add_handler(
+                CommandHandler("start", start)
+            )
+
+            application.add_handler(
+                CommandHandler("admin", admin_command)
+            )
+
+            application.add_handler(
+                CommandHandler("cancel", cancel)
+            )
+
+            application.add_handler(
+                CallbackQueryHandler(callback_handler)
+            )
+
+            application.add_handler(
+                MessageHandler(
+                    filters.ALL & ~filters.COMMAND,
+                    message_handler
+                )
+            )
+
+            application.add_error_handler(
+                error_handler
+            )
+
+            logger.info(
+                "Initializing Telegram application..."
+            )
+
+            await application.initialize()
+
+            logger.info(
+                "Starting Telegram application..."
+            )
+
+            await application.start()
+
+            logger.info(
+                "Connecting to Telegram..."
+            )
+
+            me = await application.bot.get_me()
+
+            logger.info(
+                "Telegram connected: @%s",
+                me.username
+            )
+
+            webhook_url = (
+                RENDER_EXTERNAL_URL
+                + WEBHOOK_PATH
+            )
+
+            logger.info(
+                "Setting Telegram webhook..."
+            )
+
+            webhook_result = await application.bot.set_webhook(
+
+                url=webhook_url,
+
+                secret_token=WEBHOOK_SECRET or None,
+
+                allowed_updates=Update.ALL_TYPES,
+
+                drop_pending_updates=False
+
+            )
+
+            if not webhook_result:
+
+                raise RuntimeError(
+                    "Telegram webhook setup failed"
                 )
 
-        except Exception:
+            # Publish the initialized application.
 
-            logger.exception(
-                "Queued update processing failed"
+            bot_application = application
+
+            bot_username = me.username
+
+            bot_start_error = None
+
+            bot_ready.set()
+
+            logger.info(
+                "===================================="
             )
 
-        finally:
+            logger.info(
+                "AMR CLOUD READY"
+            )
 
-            update_queue.task_done()
+            logger.info(
+                "BOT: @%s",
+                bot_username
+            )
+
+            logger.info(
+                "WEBHOOK: %s",
+                webhook_url
+            )
+
+            logger.info(
+                "===================================="
+            )
+
+            return
+
+        except Exception as error:
+
+            bot_ready.clear()
+
+            bot_application = None
+
+            bot_username = None
+
+            bot_start_error = str(error)
+
+            logger.exception(
+                "BOT STARTUP FAILED. RETRYING..."
+            )
+
+            if application:
+
+                with suppress(Exception):
+
+                    if application.running:
+
+                        await application.stop()
+
+                with suppress(Exception):
+
+                    await application.shutdown()
+
+            await asyncio.sleep(
+                STARTUP_RETRY_SECONDS
+            )
 
 
 # =========================================================
-# BOT STARTUP
+# BOT EVENT LOOP THREAD
 # =========================================================
 
 def run_bot():
 
-    global bot_application
     global bot_loop
-    global bot_username
-    global bot_start_error
 
     loop = asyncio.new_event_loop()
 
@@ -1425,125 +1838,82 @@ def run_bot():
 
     bot_loop = loop
 
-    async def initialize():
-
-        global bot_application
-        global bot_username
-        global bot_start_error
-
-        logger.info("Creating Telegram application...")
-
-        application = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .build()
-        )
-
-        application.add_handler(
-            CommandHandler("start", start)
-        )
-
-        application.add_handler(
-            CommandHandler("admin", admin_command)
-        )
-
-        application.add_handler(
-            CommandHandler("cancel", cancel)
-        )
-
-        application.add_handler(
-            CallbackQueryHandler(callback_handler)
-        )
-
-        application.add_handler(
-            MessageHandler(
-                filters.ALL & ~filters.COMMAND,
-                message_handler
-            )
-        )
-
-        application.add_error_handler(
-            error_handler
-        )
-
-        logger.info("Initializing Telegram application...")
-
-        await application.initialize()
-
-        logger.info("Starting Telegram application...")
-
-        await application.start()
-
-        logger.info("Connecting to Telegram API...")
-
-        me = await application.bot.get_me()
-
-        bot_username = me.username
-
-        logger.info(
-            "Telegram connected: @%s",
-            bot_username
-        )
-
-        bot_application = application
-
-        # Start processing queued updates.
-        asyncio.create_task(
-            update_worker()
-        )
-
-        webhook_url = (
-            RENDER_EXTERNAL_URL + WEBHOOK_PATH
-        )
-
-        logger.info("Setting Telegram webhook...")
-
-        webhook_result = await application.bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET or None,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False
-        )
-
-        if not webhook_result:
-
-            raise RuntimeError(
-                "Telegram setWebhook returned False"
-            )
-
-        bot_start_error = None
-
-        bot_ready.set()
-
-        logger.info(
-            "AMR CLOUD READY: @%s",
-            bot_username
-        )
+    logger.info(
+        "Telegram event loop starting..."
+    )
 
     try:
 
-        loop.run_until_complete(
-            initialize()
+        loop.create_task(
+            bot_startup_supervisor()
         )
 
         loop.run_forever()
 
-    except Exception as error:
-
-        bot_start_error = str(error)
-
-        bot_ready.clear()
+    except Exception:
 
         logger.exception(
-            "BOT STARTUP FAILED"
+            "Telegram event loop stopped unexpectedly"
         )
 
     finally:
 
         bot_ready.clear()
 
-        logger.error(
-            "Telegram bot event loop stopped."
+        logger.warning(
+            "Telegram event loop stopped."
+        )
+
+        pending = asyncio.all_tasks(loop)
+
+        for task in pending:
+
+            task.cancel()
+
+        with suppress(Exception):
+
+            loop.run_until_complete(
+                asyncio.gather(
+                    *pending,
+                    return_exceptions=True
+                )
+            )
+
+        loop.close()
+
+
+# =========================================================
+# START BOT THREAD
+# =========================================================
+
+def start_bot_thread():
+
+    global bot_thread
+
+    with startup_lock:
+
+        if bot_thread and bot_thread.is_alive():
+
+            logger.info(
+                "Telegram thread already running."
+            )
+
+            return
+
+        bot_thread = threading.Thread(
+
+            target=run_bot,
+
+            daemon=True,
+
+            name="AMR-TELEGRAM-BOT"
+
+        )
+
+        bot_thread.start()
+
+        logger.info(
+            "Telegram background thread started."
         )
 
 
@@ -1554,17 +1924,19 @@ def run_bot():
 @app.route("/", methods=["GET"])
 def home():
 
+    ready = bot_ready.is_set()
+
     return jsonify({
 
-        "status": "online",
+        "status": "online" if ready else "starting",
 
         "service": "AMR CLOUD",
 
-        "bot_ready": bot_ready.is_set(),
+        "bot_ready": ready,
 
         "bot_username": bot_username
 
-    })
+    }), 200 if ready else 503
 
 
 # =========================================================
@@ -1599,7 +1971,7 @@ def health():
 )
 def telegram_webhook():
 
-    # Validate Telegram secret first.
+    # Check secret token.
 
     if WEBHOOK_SECRET:
 
@@ -1619,61 +1991,98 @@ def telegram_webhook():
                 "error": "Unauthorized"
             }), 403
 
-    # Read Telegram update.
+    # Read JSON.
 
-    data = request.get_json(silent=True)
+    data = request.get_json(
+        silent=True
+    )
 
     if not isinstance(data, dict):
 
         return jsonify({
+
             "ok": False,
+
             "error": "Invalid JSON"
+
         }), 400
 
-    # Do not reject updates just because startup is
-    # still running. Store them for later processing.
+    # Bot must be ready.
 
-    try:
+    if not bot_ready.is_set() or not bot_loop:
 
-        update_queue.put_nowait(data)
-
-    except queue.Full:
-
-        logger.error(
-            "Update queue is full."
+        logger.warning(
+            "Webhook received while bot is not ready."
         )
 
         return jsonify({
+
             "ok": False,
-            "error": "Queue full"
+
+            "error": "Bot is starting"
+
         }), 503
 
-    return jsonify({
-        "ok": True
-    }), 200
+    # Process update on Telegram event loop.
+
+    try:
+
+        future = asyncio.run_coroutine_threadsafe(
+
+            process_webhook_update(data),
+
+            bot_loop
+
+        )
+
+        future.result(
+            timeout=WEBHOOK_PROCESS_TIMEOUT
+        )
+
+        return jsonify({
+
+            "ok": True
+
+        }), 200
+
+    except Exception:
+
+        logger.exception(
+            "Webhook update processing failed."
+        )
+
+        return jsonify({
+
+            "ok": False,
+
+            "error": "Update processing failed"
+
+        }), 500
 
 
 # =========================================================
-# START APPLICATION
+# DATABASE AND BOT INITIALIZATION
 # =========================================================
 
-logger.info("AMR CLOUD starting...")
+logger.info(
+    "AMR CLOUD starting..."
+)
 
-logger.info("Initializing database...")
+logger.info(
+    "Initializing database..."
+)
 
 init_db()
 
-logger.info("Starting Telegram background thread...")
-
-bot_thread = threading.Thread(
-    target=run_bot,
-    daemon=True,
-    name="telegram-bot"
+logger.info(
+    "Starting Telegram background thread..."
 )
 
-bot_thread.start()
+start_bot_thread()
 
-logger.info("Flask application initialized.")
+logger.info(
+    "Flask application initialized."
+)
 
 
 # =========================================================
@@ -1683,7 +2092,11 @@ logger.info("Flask application initialized.")
 if __name__ == "__main__":
 
     app.run(
+
         host="0.0.0.0",
+
         port=PORT,
+
         threaded=True
+
     )
