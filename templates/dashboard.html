@@ -2,219 +2,457 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-    <meta name="viewport"
-          content="width=device-width, initial-scale=1.0">
+    <title>Cloud Dashboard — DESI CLOUD</title>
+    <meta name="theme-color" content="#080b12">
 
-    <title>Dashboard — DESI CLOUD</title>
+    <style>
+        :root {
+            --bg: #080b12;
+            --surface: #111827;
+            --surface2: #151f30;
+            --border: rgba(255,255,255,.08);
+            --text: #f5f7fb;
+            --muted: #929db0;
+            --primary: #718cff;
+            --green: #35d49a;
+        }
 
-    <meta name="description"
-          content="Explore DESI CLOUD public storage statistics.">
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
 
-    <link rel="stylesheet"
-          href="{{ url_for('static', filename='css/style.css') }}">
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: Inter, system-ui, sans-serif;
+            min-height: 100vh;
+        }
+
+        a {
+            color: inherit;
+            text-decoration: none;
+        }
+
+        .container {
+            width: min(1100px, 92%);
+            margin: auto;
+        }
+
+        header {
+            height: 75px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 850;
+            letter-spacing: 1px;
+            font-size: 19px;
+        }
+
+        .logo-icon {
+            display: grid;
+            place-items: center;
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, #668aff, #9871ff);
+            border-radius: 11px;
+        }
+
+        .back-link {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .back-link:hover {
+            color: white;
+        }
+
+        .page-heading {
+            padding: 55px 0 30px;
+        }
+
+        .page-heading h1 {
+            font-size: clamp(29px, 5vw, 42px);
+            margin-bottom: 10px;
+        }
+
+        .page-heading p {
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 35px;
+        }
+
+        .stat-card {
+            padding: 23px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+        }
+
+        .stat-icon {
+            font-size: 21px;
+            margin-bottom: 15px;
+        }
+
+        .stat-number {
+            font-size: 29px;
+            font-weight: 800;
+            margin-bottom: 6px;
+        }
+
+        .stat-label {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            overflow: hidden;
+            margin-bottom: 60px;
+        }
+
+        .section-header {
+            padding: 22px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 15px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .section-header h2 {
+            font-size: 17px;
+        }
+
+        .section-header span {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .table-wrapper {
+            width: 100%;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 570px;
+        }
+
+        th, td {
+            padding: 17px 22px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }
+
+        th {
+            color: var(--muted);
+            font-weight: 600;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: .7px;
+        }
+
+        td {
+            color: #dce3ef;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .file-name {
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            font-weight: 650;
+        }
+
+        .file-icon {
+            width: 36px;
+            height: 36px;
+            display: grid;
+            place-items: center;
+            background: var(--surface2);
+            border-radius: 10px;
+            font-size: 17px;
+        }
+
+        .file-type {
+            display: inline-block;
+            padding: 6px 9px;
+            border-radius: 7px;
+            background: rgba(113,140,255,.12);
+            color: #9db0ff;
+            font-size: 11px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 65px 20px;
+        }
+
+        .empty-icon {
+            font-size: 43px;
+            margin-bottom: 15px;
+        }
+
+        .empty-state h3 {
+            font-size: 18px;
+            margin-bottom: 9px;
+        }
+
+        .empty-state p {
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.7;
+        }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 15px;
+            padding: 22px;
+            border-top: 1px solid var(--border);
+        }
+
+        .page-button {
+            padding: 9px 15px;
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            font-size: 12px;
+            color: white;
+            background: var(--surface2);
+        }
+
+        .page-button:hover {
+            border-color: var(--primary);
+        }
+
+        .page-info {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 25px 0;
+            text-align: center;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        @media(max-width: 650px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+
+            .stat-card {
+                padding: 19px;
+            }
+
+            .page-heading {
+                padding-top: 40px;
+            }
+
+            .section-header {
+                padding: 18px;
+            }
+        }
+    </style>
 </head>
 
 <body>
 
-<header class="navbar">
+    <div class="container">
 
-    <div class="container nav-content">
+        <!-- HEADER -->
 
-        <a href="/" class="brand">
-            <span class="brand-icon">☁</span>
-            <span>DESI <strong>CLOUD</strong></span>
-        </a>
+        <header>
+            <a href="/" class="logo">
+                <span class="logo-icon">☁</span>
+                <span>DESI CLOUD</span>
+            </a>
 
-        <nav class="nav-links">
-            <a href="/">Home</a>
-            <a href="/dashboard" class="active">Dashboard</a>
-        </nav>
+            <a href="/" class="back-link">← Back to Home</a>
+        </header>
 
-        <a class="btn btn-primary"
-           href="https://t.me/{{ bot_username }}"
-           target="_blank"
-           rel="noopener">
-            Open Bot ↗
-        </a>
+        <!-- PAGE HEADING -->
+
+        <section class="page-heading">
+            <h1>Cloud Dashboard</h1>
+            <p>Explore the public statistics and latest shared files on DESI CLOUD.</p>
+        </section>
+
+        <!-- STATISTICS -->
+
+        <section class="stats">
+
+            <div class="stat-card">
+                <div class="stat-icon">👥</div>
+                <div class="stat-number">
+                    {{ stats.users | default(0) }}
+                </div>
+                <div class="stat-label">Registered Users</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon">📁</div>
+                <div class="stat-number">
+                    {{ stats.files | default(0) }}
+                </div>
+                <div class="stat-label">Stored Files</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon">⬇️</div>
+                <div class="stat-number">
+                    {{ stats.downloads | default(0) }}
+                </div>
+                <div class="stat-label">Total Downloads</div>
+            </div>
+
+        </section>
+
+        <!-- PUBLIC FILES -->
+
+        <section class="section">
+
+            <div class="section-header">
+                <h2>Recently Shared Files</h2>
+                <span>Public files only</span>
+            </div>
+
+            {% if files %}
+
+                <div class="table-wrapper">
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>File Name</th>
+                                <th>Type</th>
+                                <th>Size</th>
+                                <th>Views</th>
+                                <th>Downloads</th>
+                                <th>Date</th>
+                            </tr>
+                        </thead>
+
+                        <tbody>
+
+                            {% for file in files %}
+
+                                <tr>
+                                    <td>
+                                        <div class="file-name">
+                                            <div class="file-icon">📄</div>
+
+                                            <span>
+                                                {{ file.file_name | default("Unnamed file") | e }}
+                                            </span>
+                                        </div>
+                                    </td>
+
+                                    <td>
+                                        <span class="file-type">
+                                            {{ file.file_type | default("File") | upper | e }}
+                                        </span>
+                                    </td>
+
+                                    <td>
+                                        {{ file.file_size_formatted | default("—") }}
+                                    </td>
+
+                                    <td>
+                                        {{ file.views | default(0) }}
+                                    </td>
+
+                                    <td>
+                                        {{ file.downloads | default(0) }}
+                                    </td>
+
+                                    <td>
+                                        {{ file.created_at_formatted | default("—") }}
+                                    </td>
+                                </tr>
+
+                            {% endfor %}
+
+                        </tbody>
+                    </table>
+
+                </div>
+
+            {% else %}
+
+                <div class="empty-state">
+                    <div class="empty-icon">☁️</div>
+                    <h3>No Public Files Yet</h3>
+                    <p>
+                        There are currently no publicly shared files.
+                        Files will appear here when sharing is enabled.
+                    </p>
+                </div>
+
+            {% endif %}
+
+            <!-- PAGINATION -->
+
+            {% if total_pages | default(1) > 1 %}
+
+                <div class="pagination">
+
+                    {% if page > 0 %}
+                        <a class="page-button"
+                           href="/dashboard?page={{ page - 1 }}">
+                            ← Previous
+                        </a>
+                    {% endif %}
+
+                    <span class="page-info">
+                        Page {{ page + 1 }} of {{ total_pages }}
+                    </span>
+
+                    {% if page + 1 < total_pages %}
+                        <a class="page-button"
+                           href="/dashboard?page={{ page + 1 }}">
+                            Next →
+                        </a>
+                    {% endif %}
+
+                </div>
+
+            {% endif %}
+
+        </section>
+
+        <footer>
+            © {{ current_year | default(2026) }} DESI CLOUD. All rights reserved.
+        </footer>
 
     </div>
-
-</header>
-
-
-<main class="dashboard-page">
-
-    <section class="dashboard-header">
-
-        <div class="container">
-
-            <span class="section-label">CLOUD OVERVIEW</span>
-
-            <h1>
-                Cloud <span class="gradient-text">Dashboard</span>
-            </h1>
-
-            <p>
-                An overview of DESI CLOUD platform activity.
-            </p>
-
-        </div>
-
-    </section>
-
-
-    <section class="dashboard-stats">
-
-        <div class="container">
-
-            <div class="stats-grid">
-
-                <div class="stat-card">
-                    <span class="stat-icon">👥</span>
-
-                    <h2>
-                        {{ stats.users|default(0) }}
-                    </h2>
-
-                    <p>Registered Users</p>
-                </div>
-
-
-                <div class="stat-card">
-                    <span class="stat-icon">📁</span>
-
-                    <h2>
-                        {{ stats.files|default(0) }}
-                    </h2>
-
-                    <p>Total Files</p>
-                </div>
-
-
-                <div class="stat-card">
-                    <span class="stat-icon">🔗</span>
-
-                    <h2>
-                        {{ stats.shared_files|default(0) }}
-                    </h2>
-
-                    <p>Shared Files</p>
-                </div>
-
-
-                <div class="stat-card">
-                    <span class="stat-icon">👁️</span>
-
-                    <h2>
-                        {{ stats.views|default(0) }}
-                    </h2>
-
-                    <p>Total Views</p>
-                </div>
-
-
-                <div class="stat-card">
-                    <span class="stat-icon">⬇️</span>
-
-                    <h2>
-                        {{ stats.downloads|default(0) }}
-                    </h2>
-
-                    <p>File Requests</p>
-                </div>
-
-
-                <div class="stat-card">
-                    <span class="stat-icon">☁️</span>
-
-                    <h2>ONLINE</h2>
-
-                    <p>Platform</p>
-                </div>
-
-            </div>
-
-        </div>
-
-    </section>
-
-
-    <section class="dashboard-info">
-
-        <div class="container">
-
-            <div class="info-card">
-
-                <div class="info-icon">🔒</div>
-
-                <div>
-
-                    <h3>Privacy First</h3>
-
-                    <p>
-                        This dashboard displays public platform
-                        statistics only. Private user files,
-                        Telegram IDs and personal information
-                        are not displayed here.
-                    </p>
-
-                </div>
-
-            </div>
-
-
-            <div class="info-card">
-
-                <div class="info-icon">📲</div>
-
-                <div>
-
-                    <h3>Manage Your Files</h3>
-
-                    <p>
-                        Upload, rename, share and manage your
-                        personal files using the Telegram bot.
-                    </p>
-
-                    <a class="text-link"
-                       href="https://t.me/{{ bot_username }}"
-                       target="_blank"
-                       rel="noopener">
-                        Open DESI CLOUD Bot ↗
-                    </a>
-
-                </div>
-
-            </div>
-
-        </div>
-
-    </section>
-
-</main>
-
-
-<footer class="footer">
-
-    <div class="container footer-content">
-
-        <a href="/" class="brand">
-            <span class="brand-icon">☁</span>
-            <span>DESI <strong>CLOUD</strong></span>
-        </a>
-
-        <p>
-            © {{ current_year|default(2026) }} DESI CLOUD.
-        </p>
-
-        <a href="/">Back to Home</a>
-
-    </div>
-
-</footer>
-
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
 </body>
-</html>
+                          </html>
