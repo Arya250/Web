@@ -1,90 +1,42 @@
 import os
-import secrets
-from urllib.parse import urlparse
+from dotenv import load_dotenv
 
+load_dotenv()
 
-def get_required(name):
-    value = os.getenv(name)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().replace("@", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-    if not value:
-        raise RuntimeError(
-            f"Required environment variable missing: {name}"
-        )
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+MONGO_DATABASE = os.getenv("MONGO_DATABASE", "desi_cloud")
 
-    return value.strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram-webhook")
 
-
-BOT_TOKEN = get_required("BOT_TOKEN")
-
-ADMIN_ID = int(get_required("ADMIN_ID"))
-
-DATABASE_URL = get_required("DATABASE_URL")
-
-RENDER_EXTERNAL_URL = get_required(
-    "RENDER_EXTERNAL_URL"
-).rstrip("/")
-
-WEBHOOK_SECRET = get_required("WEBHOOK_SECRET")
-
-PORT = int(os.getenv("PORT", "10000"))
-
-BOT_USERNAME = os.getenv(
-    "BOT_USERNAME", ""
-).strip().lstrip("@")
-
-WEBHOOK_PATH = "/telegram-webhook"
+MAX_DOWNLOAD_SIZE = int(
+    os.getenv("MAX_DOWNLOAD_SIZE", str(20 * 1024 * 1024))
+)
 
 WEBHOOK_URL = (
     f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+    if RENDER_EXTERNAL_URL else ""
 )
 
-WEBHOOK_MAX_CONNECTIONS = 40
 
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
+def validate_config():
+    missing = []
 
-FILES_PER_PAGE = 8
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
 
-USERS_PER_PAGE = 10
+    if not MONGO_URI:
+        missing.append("MONGO_URI")
 
-ADMIN_FILES_PER_PAGE = 10
+    if not ADMIN_ID:
+        missing.append("ADMIN_ID")
 
-BROADCAST_DELAY = 0.05
-
-UPDATE_QUEUE_SIZE = 500
-
-LOG_LEVEL = os.getenv(
-    "LOG_LEVEL", "INFO"
-).upper()
-
-SECRET_TOKEN_PATTERN = r"^[A-Za-z0-9_-]{1,256}$"
-
-TOKEN_BYTES = 24
-
-
-def generate_file_token():
-    return secrets.token_urlsafe(TOKEN_BYTES)
-
-
-def validate_webhook_secret(value):
-    if not value:
-        return False
-
-    return secrets.compare_digest(
-        value,
-        WEBHOOK_SECRET
-    )
-
-
-def validate_database_url():
-    parsed = urlparse(DATABASE_URL)
-
-    if parsed.scheme not in (
-        "postgres",
-        "postgresql"
-    ):
+    if missing:
         raise RuntimeError(
-            "DATABASE_URL must be a PostgreSQL URL."
+            "Missing environment variables: " + ", ".join(missing)
         )
-
-
-validate_database_url()
