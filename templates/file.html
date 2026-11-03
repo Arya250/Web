@@ -1,191 +1,355 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-    <meta name="viewport"
-          content="width=device-width, initial-scale=1.0">
+    <title>{{ file.file_name | default("Shared File") | e }} — DESI CLOUD</title>
+    <meta name="description" content="Access your shared file through DESI CLOUD.">
+    <meta name="theme-color" content="#080b12">
 
-    <title>{{ file.file_name|default('Shared File') }} — DESI CLOUD</title>
+    <style>
+        :root {
+            --bg: #080b12;
+            --surface: #111827;
+            --surface2: #182235;
+            --border: rgba(255,255,255,.08);
+            --text: #f5f7fb;
+            --muted: #929db0;
+            --primary: #718cff;
+            --success: #35d49a;
+        }
 
-    <meta name="description"
-          content="Access a shared file through DESI CLOUD Telegram bot.">
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
 
-    <link rel="stylesheet"
-          href="{{ url_for('static', filename='css/style.css') }}">
+        body {
+            min-height: 100vh;
+            background: var(--bg);
+            color: var(--text);
+            font-family: Inter, system-ui, sans-serif;
+            display: flex;
+            flex-direction: column;
+        }
 
+        a {
+            text-decoration: none;
+            color: inherit;
+        }
+
+        .glow {
+            position: fixed;
+            width: 420px;
+            height: 420px;
+            background: #536dff;
+            filter: blur(150px);
+            opacity: .13;
+            top: -180px;
+            left: 50%;
+            transform: translateX(-50%);
+            pointer-events: none;
+        }
+
+        .container {
+            width: min(850px, 92%);
+            margin: auto;
+            position: relative;
+            z-index: 1;
+        }
+
+        header {
+            height: 75px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 19px;
+            font-weight: 850;
+            letter-spacing: 1px;
+        }
+
+        .logo-icon {
+            width: 38px;
+            height: 38px;
+            display: grid;
+            place-items: center;
+            border-radius: 11px;
+            background: linear-gradient(135deg, #668aff, #9871ff);
+        }
+
+        .home-link {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .home-link:hover {
+            color: white;
+        }
+
+        main {
+            flex: 1;
+            display: grid;
+            place-items: center;
+            padding: 65px 0;
+        }
+
+        .file-card {
+            width: 100%;
+            max-width: 590px;
+            padding: 35px;
+            background: linear-gradient(145deg, #141e30, #101622);
+            border: 1px solid var(--border);
+            border-radius: 23px;
+            box-shadow: 0 25px 80px rgba(0,0,0,.25);
+        }
+
+        .file-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: rgba(53,212,154,.09);
+            border: 1px solid rgba(53,212,154,.18);
+            color: var(--success);
+            border-radius: 30px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: .6px;
+            margin-bottom: 25px;
+        }
+
+        .file-icon {
+            width: 85px;
+            height: 85px;
+            display: grid;
+            place-items: center;
+            background: rgba(113,140,255,.12);
+            border: 1px solid rgba(113,140,255,.17);
+            border-radius: 22px;
+            font-size: 39px;
+            margin-bottom: 24px;
+        }
+
+        h1 {
+            font-size: clamp(23px, 5vw, 32px);
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+            margin-bottom: 12px;
+        }
+
+        .description {
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.7;
+            margin-bottom: 28px;
+        }
+
+        .file-info {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-bottom: 28px;
+        }
+
+        .info-item {
+            padding: 15px;
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,.025);
+            border-radius: 12px;
+            min-width: 0;
+        }
+
+        .info-label {
+            color: var(--muted);
+            font-size: 11px;
+            margin-bottom: 7px;
+        }
+
+        .info-value {
+            font-size: 13px;
+            font-weight: 700;
+            overflow-wrap: anywhere;
+        }
+
+        .download-button {
+            width: 100%;
+            min-height: 53px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #668aff, #8269ed);
+            color: white;
+            font-size: 14px;
+            font-weight: 800;
+            cursor: pointer;
+            transition: .2s;
+        }
+
+        .download-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 30px rgba(102,138,255,.2);
+        }
+
+        .download-note {
+            text-align: center;
+            color: var(--muted);
+            font-size: 11px;
+            margin-top: 14px;
+            line-height: 1.6;
+        }
+
+        .security-note {
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+            margin-top: 27px;
+            padding: 14px;
+            background: rgba(255,255,255,.025);
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            color: var(--muted);
+            font-size: 11px;
+            line-height: 1.7;
+        }
+
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 23px 0;
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+        }
+
+        @media(max-width: 520px) {
+            .file-card {
+                padding: 24px 19px;
+            }
+
+            .file-info {
+                gap: 9px;
+            }
+
+            .info-item {
+                padding: 12px;
+            }
+        }
+    </style>
 </head>
 
+<body>
 
-<body class="file-page">
-
-<header class="navbar">
-
-    <div class="container nav-content">
-
-        <a href="/" class="brand">
-            <span class="brand-icon">☁</span>
-            <span>DESI <strong>CLOUD</strong></span>
-        </a>
-
-        <a class="btn btn-secondary"
-           href="/">
-            Home
-        </a>
-
-    </div>
-
-</header>
-
-
-<main class="file-main">
+    <div class="glow"></div>
 
     <div class="container">
 
-        <div class="file-card">
-
-            <div class="file-top-icon">
-                ☁
-            </div>
-
-
-            <span class="section-label">
-                DESI CLOUD FILE SHARING
-            </span>
-
-
-            <h1>
-                Shared <span class="gradient-text">File</span>
-            </h1>
-
-
-            <p class="file-subtitle">
-                A file has been shared with you through DESI CLOUD.
-            </p>
-
-
-            <div class="file-details">
-
-                <div class="file-detail-row">
-
-                    <span class="detail-label">
-                        File Name
-                    </span>
-
-                    <strong class="detail-value">
-                        {{ file.file_name|default('Unknown File') }}
-                    </strong>
-
-                </div>
-
-
-                <div class="file-detail-row">
-
-                    <span class="detail-label">
-                        File Type
-                    </span>
-
-                    <strong class="detail-value">
-                        {{ file.file_type|default('Unknown') }}
-                    </strong>
-
-                </div>
-
-
-                <div class="file-detail-row">
-
-                    <span class="detail-label">
-                        File Size
-                    </span>
-
-                    <strong class="detail-value">
-                        {{ file.formatted_size|default('Unknown') }}
-                    </strong>
-
-                </div>
-
-
-                <div class="file-detail-row">
-
-                    <span class="detail-label">
-                        Uploaded
-                    </span>
-
-                    <strong class="detail-value">
-                        {{ file.created_at|default('Not available') }}
-                    </strong>
-
-                </div>
-
-
-                <div class="file-detail-row">
-
-                    <span class="detail-label">
-                        Views
-                    </span>
-
-                    <strong class="detail-value">
-                        {{ file.views|default(0) }}
-                    </strong>
-
-                </div>
-
-            </div>
-
-
-            <div class="file-notice">
-
-                <span>ℹ️</span>
-
-                <p>
-                    This file is delivered through Telegram.
-                    Open the bot to access the shared file.
-                </p>
-
-            </div>
-
-
-            <a class="btn btn-primary btn-large file-download-btn"
-               href="https://t.me/{{ bot_username }}?start=file_{{ file.token }}"
-               target="_blank"
-               rel="noopener">
-
-                Open File in Telegram ↗
-
+        <header>
+            <a href="/" class="logo">
+                <span class="logo-icon">☁</span>
+                <span>DESI CLOUD</span>
             </a>
 
+            <a href="/" class="home-link">Home ↗</a>
+        </header>
 
-            <p class="file-footer-note">
-                Secure access powered by DESI CLOUD.
-            </p>
+        <main>
 
-        </div>
+            <section class="file-card">
+
+                <div class="file-label">
+                    <span>●</span>
+                    PUBLIC FILE
+                </div>
+
+                <div class="file-icon">📄</div>
+
+                <h1>{{ file.file_name | default("Shared File") | e }}</h1>
+
+                <p class="description">
+                    This file has been shared through DESI CLOUD.
+                    Use the button below to access the file.
+                </p>
+
+                <div class="file-info">
+
+                    <div class="info-item">
+                        <div class="info-label">FILE TYPE</div>
+                        <div class="info-value">
+                            {{ file.file_type | default("File") | upper | e }}
+                        </div>
+                    </div>
+
+                    <div class="info-item">
+                        <div class="info-label">FILE SIZE</div>
+                        <div class="info-value">
+                            {{ file.file_size_formatted | default("Unknown") }}
+                        </div>
+                    </div>
+
+                    <div class="info-item">
+                        <div class="info-label">VIEWS</div>
+                        <div class="info-value">
+                            {{ file.views | default(0) }}
+                        </div>
+                    </div>
+
+                    <div class="info-item">
+                        <div class="info-label">DOWNLOADS</div>
+                        <div class="info-value">
+                            {{ file.downloads | default(0) }}
+                        </div>
+                    </div>
+
+                </div>
+
+                {% if download_url %}
+
+                    <a class="download-button" href="{{ download_url | e }}">
+                        ⬇ Download File
+                    </a>
+
+                {% else %}
+
+                    <button class="download-button" disabled
+                            style="opacity:.5;cursor:not-allowed;">
+                        File Currently Unavailable
+                    </button>
+
+                {% endif %}
+
+                <p class="download-note">
+                    Download availability depends on the file and Telegram access.
+                </p>
+
+                <div class="security-note">
+                    <span>🔒</span>
+                    <span>
+                        Only download files from sources you trust.
+                        DESI CLOUD does not guarantee the safety of
+                        files shared by other users.
+                    </span>
+                </div>
+
+            </section>
+
+        </main>
+
+        <footer>
+            © {{ current_year | default(2026) }} DESI CLOUD. All rights reserved.
+        </footer>
 
     </div>
-
-</main>
-
-
-<footer class="footer">
-
-    <div class="container footer-content">
-
-        <a href="/" class="brand">
-            <span class="brand-icon">☁</span>
-            <span>DESI <strong>CLOUD</strong></span>
-        </a>
-
-        <p>
-            © {{ current_year|default(2026) }} DESI CLOUD.
-        </p>
-
-    </div>
-
-</footer>
-
-
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
 </body>
 </html>
