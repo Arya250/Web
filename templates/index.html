@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>DESI CLOUD — Personal Telegram Cloud Storage</title>
+
+    <meta name="description"
+          content="DESI CLOUD — Your Personal Telegram Cloud Storage. Upload, manage, share and access your files anytime through Telegram.">
+
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='css/style.css') }}">
+
+    <link rel="icon"
+          href="{{ url_for('static', filename='images/logo.svg') }}"
+          type="image/svg+xml">
+</head>
+
+<body>
+
+<header class="navbar">
+    <div class="container nav-content">
+
+        <a href="/" class="brand">
+            <span class="brand-icon">☁</span>
+            <span>DESI <strong>CLOUD</strong></span>
+        </a>
+
+        <nav class="nav-links">
+            <a href="/">Home</a>
+            <a href="/dashboard">Dashboard</a>
+            <a href="#features">Features</a>
+        </nav>
+
+        <a class="btn btn-primary"
+           href="https://t.me/{{ bot_username }}"
+           target="_blank"
+           rel="noopener">
+            Open Telegram ↗
+        </a>
+
+    </div>
+</header>
+
+
+<main>
+
+    <section class="hero">
+        <div class="container hero-content">
+
+            <div class="hero-badge">
+                <span class="status-dot"></span>
+                YOUR PERSONAL CLOUD STORAGE
+            </div>
+
+            <h1>
+                Your Files.<br>
+                Your Cloud.<br>
+                <span class="gradient-text">Your Control.</span>
+            </h1>
+
+            <p class="hero-description">
+                Upload, manage, share and access your files anytime
+                through Telegram. A simple and convenient cloud
+                storage experience powered by DESI CLOUD.
+            </p>
+
+            <div class="hero-actions">
+
+                <a class="btn btn-primary btn-large"
+                   href="https://t.me/{{ bot_username }}"
+                   target="_blank"
+                   rel="noopener">
+                    Get Started ↗
+                </a>
+
+                <a class="btn btn-secondary btn-large"
+                   href="/dashboard">
+                    Explore Dashboard
+                </a>
+
+            </div>
+
+            <div class="hero-note">
+                <span>🔒</span>
+                Simple file management through Telegram
+            </div>
+
+        </div>
+    </section>
+
+
+    <section class="stats-section">
+        <div class="container stats-grid">
+
+            <div class="stat-card">
+                <span class="stat-icon">👥</span>
+                <h2>{{ stats.users|default(0) }}</h2>
+                <p>Registered Users</p>
+            </div>
+
+            <div class="stat-card">
+                <span class="stat-icon">📁</span>
+                <h2>{{ stats.files|default(0) }}</h2>
+                <p>Files Stored</p>
+            </div>
+
+            <div class="stat-card">
+                <span class="stat-icon">👁️</span>
+                <h2>{{ stats.views|default(0) }}</h2>
+                <p>Total Views</p>
+            </div>
+
+            <div class="stat-card">
+                <span class="stat-icon">⬇️</span>
+                <h2>{{ stats.downloads|default(0) }}</h2>
+                <p>File Requests</p>
+            </div>
+
+        </div>
+    </section>
+
+
+    <section class="features-section" id="features">
+
+        <div class="container">
+
+            <div class="section-heading">
+                <span class="section-label">FEATURES</span>
+
+                <h2>
+                    Everything you need.<br>
+                    <span class
