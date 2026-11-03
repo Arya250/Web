@@ -1028,3 +1028,26 @@ button:focus-visible {
     color: white;
     background: rgba(105,124,255,0.45);
 }
+.stat-card,
+.feature-card,
+.info-card {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+
+    .stat-card:not(.is-visible),
+    .feature-card:not(.is-visible),
+    .info-card:not(.is-visible) {
+        opacity: 0.85;
+    }
+
+    .stat-card.is-visible,
+    .feature-card.is-visible,
+    .info-card.is-visible {
+        opacity: 1;
+        transition: opacity 0.5s ease;
+    }
+
+}
