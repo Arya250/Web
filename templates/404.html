@@ -1,115 +1,199 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-
     <meta charset="UTF-8">
-
-    <meta name="viewport"
-          content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
     <title>404 — Page Not Found | DESI CLOUD</title>
+    <meta name="theme-color" content="#080b12">
 
-    <link rel="stylesheet"
-          href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        :root {
+            --bg: #080b12;
+            --surface: #111827;
+            --border: rgba(255,255,255,.08);
+            --text: #f5f7fb;
+            --muted: #929db0;
+            --primary: #718cff;
+        }
 
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--bg);
+            color: var(--text);
+            font-family: Inter, system-ui, sans-serif;
+            padding: 20px;
+            overflow: hidden;
+        }
+
+        .glow {
+            position: fixed;
+            width: 400px;
+            height: 400px;
+            background: #536dff;
+            filter: blur(140px);
+            opacity: .15;
+            pointer-events: none;
+        }
+
+        .error-card {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 510px;
+            padding: 50px 30px;
+            text-align: center;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 23px;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 17px;
+            font-weight: 850;
+            letter-spacing: 1px;
+            margin-bottom: 45px;
+        }
+
+        .logo-icon {
+            width: 36px;
+            height: 36px;
+            display: grid;
+            place-items: center;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #668aff, #9871ff);
+        }
+
+        .error-code {
+            font-size: clamp(85px, 20vw, 125px);
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: -7px;
+            background: linear-gradient(135deg, #7da0ff, #a47aff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 25px;
+            margin-bottom: 13px;
+        }
+
+        p {
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.8;
+            margin-bottom: 30px;
+        }
+
+        .buttons {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 13px 21px;
+            border-radius: 11px;
+            font-size: 13px;
+            font-weight: 750;
+            text-decoration: none;
+            transition: .2s;
+        }
+
+        .button:hover {
+            transform: translateY(-3px);
+        }
+
+        .primary {
+            background: linear-gradient(135deg, #668aff, #8269ed);
+            color: white;
+        }
+
+        .secondary {
+            background: #1a2537;
+            border: 1px solid var(--border);
+            color: white;
+        }
+
+        .footer {
+            margin-top: 40px;
+            color: var(--muted);
+            font-size: 11px;
+        }
+
+        @media(max-width: 450px) {
+            .error-card {
+                padding: 38px 20px;
+            }
+
+            .logo {
+                margin-bottom: 35px;
+            }
+
+            h1 {
+                font-size: 22px;
+            }
+        }
+    </style>
 </head>
 
+<body>
 
-<body class="error-page">
+    <div class="glow"></div>
 
-<header class="navbar">
+    <main class="error-card">
 
-    <div class="container nav-content">
-
-        <a href="/" class="brand">
-
-            <span class="brand-icon">☁</span>
-
-            <span>DESI <strong>CLOUD</strong></span>
-
+        <a href="/" class="logo" style="color:inherit;text-decoration:none;">
+            <span class="logo-icon">☁</span>
+            <span>DESI CLOUD</span>
         </a>
 
-    </div>
+        <div class="error-code">404</div>
 
-</header>
+        <h1>Page Not Found</h1>
 
+        <p>
+            The page you're looking for doesn't exist,
+            may have been moved, or is no longer available.
+            Check the link and try again.
+        </p>
 
-<main class="error-main">
+        <div class="buttons">
 
-    <div class="container">
+            <a href="/" class="button primary">
+                ← Back to Home
+            </a>
 
-        <div class="error-card">
-
-            <div class="error-icon">
-                ☁
-            </div>
-
-
-            <h1>
-                404
-            </h1>
-
-
-            <h2>
-                Page Not Found
-            </h2>
-
-
-            <p>
-                The page or file you are looking for may have
-                been removed, disabled, or the link may be invalid.
-            </p>
-
-
-            <div class="error-actions">
-
-                <a href="/"
-                   class="btn btn-primary btn-large">
-
-                    Back to Home
-
-                </a>
-
-
-                <a href="https://t.me/{{ bot_username }}"
-                   target="_blank"
-                   rel="noopener"
-                   class="btn btn-secondary btn-large">
-
-                    Open Telegram ↗
-
-                </a>
-
-            </div>
+            <a href="/dashboard" class="button secondary">
+                Cloud Dashboard
+            </a>
 
         </div>
 
-    </div>
+        <div class="footer">
+            © 2026 DESI CLOUD. All rights reserved.
+        </div>
 
-</main>
-
-
-<footer class="footer">
-
-    <div class="container footer-content">
-
-        <a href="/" class="brand">
-            <span class="brand-icon">☁</span>
-            <span>DESI <strong>CLOUD</strong></span>
-        </a>
-
-        <p>
-            © {{ current_year|default(2026) }} DESI CLOUD.
-        </p>
-
-    </div>
-
-</footer>
-
-
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    </main>
 
 </body>
-
 </html>
