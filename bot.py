@@ -1,6 +1,4 @@
 import os
-import json
-import time
 import asyncio
 import logging
 import threading
@@ -46,7 +44,7 @@ logger = logging.getLogger("DESI_CLOUD")
 
 
 # ==========================================
-# FLASK APP
+# FLASK
 # ==========================================
 
 app = Flask(__name__)
@@ -61,6 +59,7 @@ app.config["JSON_SORT_KEYS"] = False
 class BotRuntime:
 
     def __init__(self):
+
         self.application = None
 
         self.loop = None
@@ -75,16 +74,19 @@ class BotRuntime:
 
         self.thread = None
 
+        self.lock = threading.RLock()
+
 
 runtime = BotRuntime()
 
 
 # ==========================================
-# TEMPLATE HELPERS
+# TEMPLATE GLOBALS
 # ==========================================
 
 @app.context_processor
 def inject_globals():
+
     return {
         "bot_username": BOT_USERNAME,
         "website_url": RENDER_EXTERNAL_URL
@@ -92,24 +94,34 @@ def inject_globals():
 
 
 # ==========================================
-# WEBSITE HOME
+# HOMEPAGE
 # ==========================================
 
 @app.route("/")
 def homepage():
 
-    if not db.db:
-        return render_template(
-            "index.html",
-            stats={
-                "total_files": 0,
-                "total_users": 0,
-                "total_views": 0,
-                "total_downloads": 0
-            }
+    default_stats = {
+        "total_files": 0,
+        "total_users": 0,
+        "total_views": 0,
+        "total_downloads": 0
+    }
+
+    try:
+
+        if db.db is None:
+            stats = default_stats
+
+        else:
+            stats = db.get_public_statistics()
+
+    except Exception:
+
+        logger.exception(
+            "Homepage statistics failed."
         )
 
-    stats = db.get_public_statistics()
+        stats = default_stats
 
     return render_template(
         "index.html",
@@ -124,71 +136,118 @@ def homepage():
 @app.route("/dashboard")
 def dashboard():
 
-    if not db.db:
+    if db.db is None:
         abort(503)
 
-    stats = db.get_public_statistics()
+    try:
 
-    recent_files = list(
-        db.files.find(
-            {
-                "is_public": True,
-                "sharing_enabled": True
-            },
-            {
-                "file_id": 0,
-                "_id": 0
-            }
+        stats = db.get_public_statistics()
+
+        recent_files = list(
+            db.files.find(
+                {
+                    "is_public": True,
+                    "sharing_enabled": True
+                },
+                {
+                    "file_id": 0,
+                    "_id": 0,
+                    "uploaded_by": 0
+                }
+            )
+            .sort("created_at", -1)
+            .limit(10)
         )
-        .sort("created_at", -1)
-        .limit(10)
-    )
 
-    return render_template(
-        "dashboard.html",
-        stats=stats,
-        recent_files=recent_files
-    )
+        return render_template(
+            "dashboard.html",
+            stats=stats,
+            recent_files=recent_files
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Dashboard loading failed."
+        )
+
+        abort(500)
 
 
 # ==========================================
-# PUBLIC FILE PAGE
+# PUBLIC FILE
 # ==========================================
 
 @app.route("/file/<token>")
 def shared_file(token):
 
-    if not db.db:
+    if db.db is None:
         abort(503)
 
-    file = db.get_public_file(token)
+    try:
 
-    if not file:
-        abort(404)
+        file = db.get_public_file(token)
 
-    db.increment_file_views(file["id"])
+        if not file:
+            abort(404)
 
-    safe_file = {
-        "file_name": file.get("file_name", "Unknown"),
-        "file_type": file.get("file_type", "document"),
-        "file_size": file.get("file_size", 0),
-        "mime_type": file.get("mime_type", ""),
-        "views": file.get("views", 0) + 1,
-        "downloads": file.get("downloads", 0),
-        "created_at": file.get("created_at")
-    }
+        db.increment_file_views(file["id"])
 
-    telegram_link = (
-        f"https://t.me/{BOT_USERNAME}?start=file_{token}"
-        if BOT_USERNAME else None
-    )
+        safe_file = {
+            "file_name": file.get(
+                "file_name",
+                "Unknown"
+            ),
 
-    return render_template(
-        "file.html",
-        file=safe_file,
-        telegram_link=telegram_link,
-        token=token
-    )
+            "file_type": file.get(
+                "file_type",
+                "document"
+            ),
+
+            "file_size": file.get(
+                "file_size",
+                0
+            ),
+
+            "mime_type": file.get(
+                "mime_type",
+                ""
+            ),
+
+            "views": file.get(
+                "views",
+                0
+            ) + 1,
+
+            "downloads": file.get(
+                "downloads",
+                0
+            ),
+
+            "created_at": file.get(
+                "created_at"
+            )
+        }
+
+        telegram_link = (
+            f"https://t.me/{BOT_USERNAME}?start=file_{token}"
+            if BOT_USERNAME else None
+        )
+
+        return render_template(
+            "file.html",
+            file=safe_file,
+            telegram_link=telegram_link,
+            token=token
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Shared file page failed."
+        )
+
+        abort(500)
 
 
 # ==========================================
@@ -203,7 +262,9 @@ def robots():
         "Allow: /\n"
         "Disallow: /dashboard\n",
         200,
-        {"Content-Type": "text/plain"}
+        {
+            "Content-Type": "text/plain"
+        }
     )
 
 
@@ -214,85 +275,159 @@ def robots():
 @app.route("/health")
 def health():
 
-    return jsonify({
-        "status": "ok",
-        "database": bool(db.db),
-        "bot_ready": runtime.ready.is_set(),
+    database_ready = db.is_database_ready()
+
+    bot_ready = runtime.ready.is_set()
+
+    healthy = database_ready and bot_ready
+
+    response = {
+        "status": "ok" if healthy else "degraded",
+
+        "database": database_ready,
+
+        "bot_ready": bot_ready,
+
+        "started": runtime.started,
+
+        "startup_error": runtime.start_error,
+
         "timestamp": datetime.now(
             timezone.utc
         ).isoformat()
-    })
+    }
 
+    return jsonify(response), (
+        200 if healthy else 503
+    )
+
+
+# ==========================================
+# STATUS
+# ==========================================
 
 @app.route("/status")
 def status():
 
     return jsonify({
+
         "project": "DESI CLOUD",
-        "database": "MongoDB Atlas",
+
+        "database": (
+            "connected"
+            if db.is_database_ready()
+            else "disconnected"
+        ),
+
         "bot_username": BOT_USERNAME,
+
         "bot_ready": runtime.ready.is_set(),
+
         "started": runtime.started,
+
         "error": runtime.start_error
-    })
+
+    }), 200
 
 
 # ==========================================
-# WEBHOOK ENDPOINT
+# WEBHOOK
 # ==========================================
 
-@app.route(WEBHOOK_PATH, methods=["POST"])
+@app.route(
+    WEBHOOK_PATH,
+    methods=["POST"]
+)
 def telegram_webhook():
 
-    if not runtime.ready.is_set():
-        return jsonify({
-            "ok": False,
-            "error": "Bot is starting"
-        }), 503
+    # ======================================
+    # SECRET VALIDATION
+    # ======================================
 
     supplied_secret = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token",
         ""
     )
 
-    if supplied_secret != WEBHOOK_SECRET:
+    if (
+        not WEBHOOK_SECRET
+        or supplied_secret != WEBHOOK_SECRET
+    ):
+
         return jsonify({
             "ok": False,
             "error": "Unauthorized"
         }), 403
 
+    # ======================================
+    # DATABASE CHECK
+    # ======================================
+
+    if db.db is None:
+
+        logger.error(
+            "Webhook received while database is unavailable."
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "Database unavailable"
+        }), 503
+
+    # ======================================
+    # JSON VALIDATION
+    # ======================================
+
     try:
-        payload = request.get_json(force=True)
+
+        payload = request.get_json(
+            silent=True
+        )
 
         if not isinstance(payload, dict):
+
             return jsonify({
                 "ok": False,
-                "error": "Invalid update"
+                "error": "Invalid JSON"
             }), 400
 
         update_id = payload.get("update_id")
 
         if update_id is None:
+
             return jsonify({
                 "ok": False,
                 "error": "Missing update_id"
             }), 400
 
-        db.save_webhook_update(
+        # ==================================
+        # QUEUE UPDATE
+        # ==================================
+
+        inserted = db.save_webhook_update(
             update_id,
             payload
         )
 
         return jsonify({
-            "ok": True
+
+            "ok": True,
+
+            "queued": inserted,
+
+            "duplicate": not inserted
+
         }), 200
 
     except Exception:
-        logger.exception("Webhook storage failed")
+
+        logger.exception(
+            "Webhook queue insertion failed."
+        )
 
         return jsonify({
             "ok": False,
-            "error": "Webhook processing error"
+            "error": "Webhook processing failed"
         }), 500
 
 
@@ -302,16 +437,31 @@ def telegram_webhook():
 
 async def process_updates():
 
+    logger.info(
+        "Telegram update worker started."
+    )
+
     while not runtime.stop_event.is_set():
 
         try:
-            item = db.claim_webhook_update()
+
+            # MongoDB calls are synchronous.
+            # Run them outside the asyncio event loop.
+
+            item = await asyncio.to_thread(
+                db.claim_webhook_update
+            )
 
             if not item:
+
                 await asyncio.sleep(0.5)
+
                 continue
 
+            update_id = item["update_id"]
+
             try:
+
                 payload = item["payload"]
 
                 update = Update.de_json(
@@ -323,26 +473,35 @@ async def process_updates():
                     update
                 )
 
-                db.complete_webhook_update(
-                    item["update_id"]
+                await asyncio.to_thread(
+                    db.complete_webhook_update,
+                    update_id
+                )
+
+                logger.info(
+                    "Update %s processed successfully.",
+                    update_id
                 )
 
             except Exception as error:
 
                 logger.exception(
-                    "Telegram update processing failed"
+                    "Update %s processing failed.",
+                    update_id
                 )
 
-                db.retry_webhook_update(
-                    item["update_id"],
+                await asyncio.to_thread(
+                    db.retry_webhook_update,
+                    update_id,
                     error
                 )
 
-                # Avoid repeatedly processing a broken update.
-                await asyncio.sleep(2)
-
         except Exception:
-            logger.exception("Update worker error")
+
+            logger.exception(
+                "Telegram update worker error."
+            )
+
             await asyncio.sleep(2)
 
 
@@ -352,9 +511,15 @@ async def process_updates():
 
 async def startup_telegram():
 
-    application = Application.builder().token(
-        BOT_TOKEN
-    ).build()
+    logger.info(
+        "Initializing Telegram application..."
+    )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
     register_handlers(application)
 
@@ -364,6 +529,10 @@ async def startup_telegram():
 
     runtime.application = application
 
+    # ======================================
+    # VERIFY BOT
+    # ======================================
+
     bot_info = await application.bot.get_me()
 
     logger.info(
@@ -371,47 +540,102 @@ async def startup_telegram():
         bot_info.username
     )
 
-    if WEBHOOK_URL:
-
-        await application.bot.set_webhook(
-            url=WEBHOOK_URL,
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False
-        )
-
-        logger.info(
-            "Telegram webhook configured."
-        )
-
-    else:
-        logger.warning(
-            "RENDER_EXTERNAL_URL missing; webhook not configured."
-        )
+    # ======================================
+    # MARK READY
+    # ======================================
 
     runtime.ready.set()
 
-    logger.info("DESI CLOUD is ready.")
+    runtime.started = True
+
+    runtime.start_error = None
+
+    logger.info(
+        "Telegram application is ready."
+    )
+
+    # ======================================
+    # CONFIGURE WEBHOOK
+    # ======================================
+
+    webhook_url = WEBHOOK_URL
+
+    if not webhook_url and RENDER_EXTERNAL_URL:
+
+        webhook_url = (
+            RENDER_EXTERNAL_URL.rstrip("/")
+            + WEBHOOK_PATH
+        )
+
+    if webhook_url:
+
+        await application.bot.set_webhook(
+
+            url=webhook_url,
+
+            secret_token=WEBHOOK_SECRET,
+
+            allowed_updates=Update.ALL_TYPES,
+
+            drop_pending_updates=False
+
+        )
+
+        logger.info(
+            "Telegram webhook configured successfully."
+        )
+
+    else:
+
+        logger.warning(
+            "Webhook URL missing. Webhook not configured."
+        )
+
+    logger.info(
+        "DESI CLOUD is ready."
+    )
+
+    # ======================================
+    # PROCESS QUEUE
+    # ======================================
 
     await process_updates()
 
+
+# ==========================================
+# TELEGRAM SHUTDOWN
+# ==========================================
 
 async def shutdown_telegram():
 
     runtime.ready.clear()
 
-    if runtime.application:
+    application = runtime.application
 
-        try:
-            if runtime.application.running:
-                await runtime.application.stop()
+    if application is None:
+        return
 
-            await runtime.application.shutdown()
+    try:
 
-        except Exception:
-            logger.exception(
-                "Telegram shutdown error"
-            )
+        if application.running:
+
+            await application.stop()
+
+        await application.shutdown()
+
+        logger.info(
+            "Telegram application stopped."
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Telegram shutdown failed."
+        )
+
+    finally:
+
+        runtime.application = None
 
 
 # ==========================================
@@ -427,9 +651,26 @@ def telegram_thread():
     runtime.loop = loop
 
     try:
+
+        # ==================================
+        # CONFIGURATION
+        # ==================================
+
+        validate_config()
+
+        # ==================================
+        # DATABASE
+        # ==================================
+
         db.initialize_database()
 
-        runtime.started = True
+        logger.info(
+            "Database initialization completed."
+        )
+
+        # ==================================
+        # TELEGRAM
+        # ==================================
 
         loop.run_until_complete(
             startup_telegram()
@@ -437,10 +678,18 @@ def telegram_thread():
 
     except Exception as error:
 
-        runtime.start_error = str(error)
+        runtime.ready.clear()
+
+        runtime.started = False
+
+        runtime.start_error = (
+            type(error).__name__
+            + ": "
+            + str(error)
+        )
 
         logger.exception(
-            "Telegram runtime startup failed"
+            "DESI CLOUD runtime startup failed."
         )
 
     finally:
@@ -448,35 +697,81 @@ def telegram_thread():
         runtime.ready.clear()
 
         try:
-            loop.run_until_complete(
-                shutdown_telegram()
+
+            if loop.is_running():
+
+                loop.run_until_complete(
+                    shutdown_telegram()
+                )
+
+            elif runtime.application:
+
+                loop.run_until_complete(
+                    shutdown_telegram()
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Runtime shutdown error."
             )
+
+        try:
+
+            loop.close()
+
         except Exception:
             pass
 
-        loop.close()
+        runtime.loop = None
+
+        runtime.started = False
+
+        db.close_database()
 
 
 # ==========================================
-# START BACKGROUND RUNTIME
+# START RUNTIME
 # ==========================================
 
 def start_runtime():
 
-    if runtime.thread and runtime.thread.is_alive():
-        return
+    with runtime.lock:
 
-    runtime.thread = threading.Thread(
-        target=telegram_thread,
-        name="desi-cloud-telegram",
-        daemon=True
-    )
+        if (
+            runtime.thread is not None
+            and runtime.thread.is_alive()
+        ):
 
-    runtime.thread.start()
+            return
+
+        runtime.stop_event.clear()
+
+        runtime.start_error = None
+
+        runtime.started = False
+
+        runtime.ready.clear()
+
+        runtime.thread = threading.Thread(
+
+            target=telegram_thread,
+
+            name="desi-cloud-telegram",
+
+            daemon=True
+
+        )
+
+        runtime.thread.start()
+
+        logger.info(
+            "DESI CLOUD background runtime started."
+        )
 
 
 # ==========================================
-# ERROR PAGES
+# ERROR HANDLERS
 # ==========================================
 
 @app.errorhandler(404)
@@ -491,7 +786,7 @@ def page_not_found(error):
 def internal_error(error):
 
     logger.exception(
-        "Website internal server error"
+        "Website internal server error."
     )
 
     return (
@@ -501,20 +796,10 @@ def internal_error(error):
 
 
 # ==========================================
-# START RUNTIME ON IMPORT
+# STARTUP
 # ==========================================
 
-try:
-
-    validate_config()
-
-    start_runtime()
-
-except Exception:
-
-    logger.exception(
-        "Configuration validation failed"
-    )
+start_runtime()
 
 
 # ==========================================
@@ -524,12 +809,20 @@ except Exception:
 if __name__ == "__main__":
 
     port = int(
-        os.environ.get("PORT", "5000")
+        os.environ.get(
+            "PORT",
+            "5000"
+        )
     )
 
     app.run(
+
         host="0.0.0.0",
+
         port=port,
+
         debug=False,
+
         use_reloader=False
-    )
+
+        )
