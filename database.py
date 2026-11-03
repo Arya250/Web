@@ -1,6 +1,7 @@
 import logging
+import threading
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from pymongo import (
     MongoClient,
@@ -8,12 +9,20 @@ from pymongo import (
     ReturnDocument
 )
 
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import (
+    DuplicateKeyError,
+    PyMongoError
+)
 
 from config import MONGO_URI, MONGO_DATABASE
 
 
 logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# DATABASE CONNECTION
+# ==========================================
 
 client = None
 db = None
@@ -25,87 +34,275 @@ force_channels = None
 counters = None
 webhook_updates = None
 
+database_lock = threading.RLock()
+
+
+# ==========================================
+# TIME
+# ==========================================
 
 def now():
     return datetime.now(timezone.utc)
 
 
+# ==========================================
+# DATABASE INITIALIZATION
+# ==========================================
+
 def initialize_database():
+
     global client, db
     global users, files, settings
-    global force_channels, counters, webhook_updates
+    global force_channels, counters
+    global webhook_updates
 
-    if not MONGO_URI:
-        raise RuntimeError("MONGO_URI is missing.")
+    with database_lock:
 
-    client = MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=10000,
-        connectTimeoutMS=10000,
-        retryWrites=True
-    )
+        if not MONGO_URI:
+            raise RuntimeError("MONGO_URI is missing.")
 
-    client.admin.command("ping")
+        if client is not None and db is not None:
 
-    db = client[MONGO_DATABASE]
+            try:
+                client.admin.command("ping")
+                logger.info("MongoDB connection already active.")
+                return True
 
-    users = db["users"]
-    files = db["files"]
-    settings = db["settings"]
-    force_channels = db["force_channels"]
-    counters = db["counters"]
-    webhook_updates = db["webhook_updates"]
+            except PyMongoError:
+                logger.warning(
+                    "Existing MongoDB connection unavailable. Reconnecting."
+                )
 
-    users.create_index("telegram_id", unique=True)
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
-    files.create_index("id", unique=True)
-    files.create_index("token", unique=True)
-    files.create_index("uploaded_by")
-    files.create_index("created_at")
+                client = None
+                db = None
 
-    settings.create_index("key", unique=True)
+        try:
 
-    force_channels.create_index("id", unique=True)
-    force_channels.create_index("chat_id", unique=True)
+            logger.info("Connecting to MongoDB Atlas...")
 
-    webhook_updates.create_index("update_id", unique=True)
+            new_client = MongoClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=10000,
+                socketTimeoutMS=20000,
+                retryWrites=True,
+                appname="DESI_CLOUD"
+            )
 
-    defaults = {
-        "start_message": "Welcome to DESI CLOUD!",
-        "about_message": "DESI CLOUD - Telegram File Storage.",
-        "help_message": "Send a file to upload it to your cloud.",
-        "force_join_enabled": False,
-        "website_enabled": True,
-        "star_message": ""
-    }
+            # Verify connection before publishing globals.
+            new_client.admin.command("ping")
 
-    for key, value in defaults.items():
-        settings.update_one(
-            {"key": key},
-            {"$setOnInsert": {"value": value}},
-            upsert=True
+            new_db = new_client[MONGO_DATABASE]
+
+            new_users = new_db["users"]
+            new_files = new_db["files"]
+            new_settings = new_db["settings"]
+            new_force_channels = new_db["force_channels"]
+            new_counters = new_db["counters"]
+            new_webhook_updates = new_db["webhook_updates"]
+
+            # ==================================
+            # INDEXES
+            # ==================================
+
+            new_users.create_index(
+                "telegram_id",
+                unique=True
+            )
+
+            new_files.create_index(
+                "id",
+                unique=True
+            )
+
+            new_files.create_index(
+                "token",
+                unique=True
+            )
+
+            new_files.create_index("uploaded_by")
+            new_files.create_index("created_at")
+
+            new_settings.create_index(
+                "key",
+                unique=True
+            )
+
+            new_force_channels.create_index(
+                "id",
+                unique=True
+            )
+
+            new_force_channels.create_index(
+                "chat_id",
+                unique=True
+            )
+
+            new_webhook_updates.create_index(
+                "update_id",
+                unique=True
+            )
+
+            new_webhook_updates.create_index([
+                ("status", 1),
+                ("created_at", 1)
+            ])
+
+            new_counters.create_index(
+                "_id",
+                unique=True
+            )
+
+            # ==================================
+            # DEFAULT SETTINGS
+            # ==================================
+
+            defaults = {
+                "start_message": "Welcome to DESI CLOUD!",
+                "about_message": "DESI CLOUD - Telegram File Storage.",
+                "help_message": "Send a file to upload it to your cloud.",
+                "force_join_enabled": False,
+                "website_enabled": True,
+                "star_message": ""
+            }
+
+            for key, value in defaults.items():
+
+                new_settings.update_one(
+                    {"key": key},
+                    {
+                        "$setOnInsert": {
+                            "value": value
+                        }
+                    },
+                    upsert=True
+                )
+
+            # ==================================
+            # RECOVER INTERRUPTED UPDATES
+            # ==================================
+
+            new_webhook_updates.update_many(
+                {"status": "processing"},
+                {
+                    "$set": {
+                        "status": "pending",
+                        "recovered_at": now()
+                    }
+                }
+            )
+
+            # ==================================
+            # PUBLISH CONNECTION
+            # ==================================
+
+            client = new_client
+            db = new_db
+
+            users = new_users
+            files = new_files
+            settings = new_settings
+            force_channels = new_force_channels
+            counters = new_counters
+            webhook_updates = new_webhook_updates
+
+            logger.info("MongoDB initialized successfully.")
+
+            return True
+
+        except Exception:
+
+            logger.exception(
+                "MongoDB initialization failed."
+            )
+
+            try:
+                new_client.close()
+            except Exception:
+                pass
+
+            client = None
+            db = None
+
+            users = None
+            files = None
+            settings = None
+            force_channels = None
+            counters = None
+            webhook_updates = None
+
+            raise
+
+
+# ==========================================
+# DATABASE HEALTH
+# ==========================================
+
+def is_database_ready():
+
+    if client is None or db is None:
+        return False
+
+    try:
+
+        client.admin.command("ping")
+
+        return True
+
+    except Exception:
+
+        logger.exception(
+            "MongoDB health check failed."
         )
 
-    # Recover updates left in processing state after a restart.
-    webhook_updates.update_many(
-        {"status": "processing"},
-        {"$set": {"status": "pending"}}
-    )
-
-    logger.info("MongoDB initialized successfully.")
+        return False
 
 
 def close_database():
-    global client
 
-    if client:
-        client.close()
+    global client, db
+
+    with database_lock:
+
+        if client is not None:
+
+            try:
+                client.close()
+            except Exception:
+                logger.exception(
+                    "MongoDB close error."
+                )
+
+        client = None
+        db = None
 
 
-# ---------------- USERS ----------------
+# ==========================================
+# INTERNAL CHECK
+# ==========================================
+
+def require_database():
+
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized."
+        )
+
+
+# ==========================================
+# USERS
+# ==========================================
 
 def register_user(user):
-    telegram_id = user.id
+
+    require_database()
+
+    telegram_id = int(user.id)
 
     users.update_one(
         {"telegram_id": telegram_id},
@@ -127,15 +324,30 @@ def register_user(user):
 
 
 def get_all_user_ids():
+
+    require_database()
+
     return list(
         users.find(
-            {"is_banned": {"$ne": True}},
-            {"telegram_id": 1, "_id": 0}
+            {
+                "is_banned": {
+                    "$ne": True
+                }
+            },
+            {
+                "telegram_id": 1,
+                "_id": 0
+            }
         )
     )
 
 
 def get_users_paginated(page=0, per_page=10):
+
+    require_database()
+
+    page = max(0, int(page))
+
     skip = page * per_page
 
     return list(
@@ -147,14 +359,24 @@ def get_users_paginated(page=0, per_page=10):
 
 
 def count_users():
+
+    require_database()
+
     return users.count_documents({})
 
 
 def get_user(user_id):
-    return users.find_one({"telegram_id": int(user_id)})
+
+    require_database()
+
+    return users.find_one({
+        "telegram_id": int(user_id)
+    })
 
 
-# ---------------- FILES ----------------
+# ==========================================
+# FILES
+# ==========================================
 
 def save_file(
     token,
@@ -166,9 +388,16 @@ def save_file(
     caption,
     uploaded_by
 ):
+
+    require_database()
+
     next_id = counters.find_one_and_update(
         {"_id": "files"},
-        {"$inc": {"value": 1}},
+        {
+            "$inc": {
+                "value": 1
+            }
+        },
         upsert=True,
         return_document=ReturnDocument.AFTER
     )
@@ -197,14 +426,27 @@ def save_file(
 
 
 def get_file_by_id(file_id):
-    return files.find_one({"id": int(file_id)})
+
+    require_database()
+
+    return files.find_one({
+        "id": int(file_id)
+    })
 
 
 def get_file_by_token(token):
-    return files.find_one({"token": token})
+
+    require_database()
+
+    return files.find_one({
+        "token": token
+    })
 
 
 def get_user_file(file_id, user_id):
+
+    require_database()
+
     return files.find_one({
         "id": int(file_id),
         "uploaded_by": int(user_id)
@@ -212,8 +454,15 @@ def get_user_file(file_id, user_id):
 
 
 def get_user_files(user_id, page=0, per_page=8):
+
+    require_database()
+
+    page = max(0, int(page))
+
     return list(
-        files.find({"uploaded_by": int(user_id)})
+        files.find({
+            "uploaded_by": int(user_id)
+        })
         .sort("created_at", DESCENDING)
         .skip(page * per_page)
         .limit(per_page)
@@ -221,12 +470,20 @@ def get_user_files(user_id, page=0, per_page=8):
 
 
 def count_user_files(user_id):
+
+    require_database()
+
     return files.count_documents({
         "uploaded_by": int(user_id)
     })
 
 
 def get_all_files(page=0, per_page=10):
+
+    require_database()
+
+    page = max(0, int(page))
+
     return list(
         files.find()
         .sort("created_at", DESCENDING)
@@ -236,24 +493,44 @@ def get_all_files(page=0, per_page=10):
 
 
 def count_all_files():
+
+    require_database()
+
     return files.count_documents({})
 
 
 def increment_file_views(file_id):
+
+    require_database()
+
     return files.update_one(
         {"id": int(file_id)},
-        {"$inc": {"views": 1}}
+        {
+            "$inc": {
+                "views": 1
+            }
+        }
     )
 
 
 def increment_file_downloads(file_id):
+
+    require_database()
+
     return files.update_one(
         {"id": int(file_id)},
-        {"$inc": {"downloads": 1}}
+        {
+            "$inc": {
+                "downloads": 1
+            }
+        }
     )
 
 
 def rename_file(file_id, user_id, new_name):
+
+    require_database()
+
     return files.update_one(
         {
             "id": int(file_id),
@@ -269,6 +546,9 @@ def rename_file(file_id, user_id, new_name):
 
 
 def delete_file(file_id, user_id):
+
+    require_database()
+
     return files.delete_one({
         "id": int(file_id),
         "uploaded_by": int(user_id)
@@ -276,12 +556,18 @@ def delete_file(file_id, user_id):
 
 
 def admin_delete_file(file_id):
+
+    require_database()
+
     return files.delete_one({
         "id": int(file_id)
     }).deleted_count > 0
 
 
 def set_file_sharing(file_id, user_id, enabled):
+
+    require_database()
+
     return files.update_one(
         {
             "id": int(file_id),
@@ -298,6 +584,9 @@ def set_file_sharing(file_id, user_id, enabled):
 
 
 def get_public_file(token):
+
+    require_database()
+
     return files.find_one({
         "token": token,
         "sharing_enabled": True,
@@ -305,10 +594,17 @@ def get_public_file(token):
     })
 
 
-# ---------------- SETTINGS ----------------
+# ==========================================
+# SETTINGS
+# ==========================================
 
 def get_setting(key, default=None):
-    result = settings.find_one({"key": key})
+
+    require_database()
+
+    result = settings.find_one({
+        "key": key
+    })
 
     if not result:
         return default
@@ -317,19 +613,46 @@ def get_setting(key, default=None):
 
 
 def set_setting(key, value):
+
+    require_database()
+
     settings.update_one(
         {"key": key},
-        {"$set": {"value": value}},
+        {
+            "$set": {
+                "value": value
+            }
+        },
         upsert=True
     )
 
 
-# ---------------- FORCE JOIN ----------------
+# ==========================================
+# FORCE JOIN
+# ==========================================
 
-def add_force_channel(chat_id, channel_username=None, channel_title=None):
+def add_force_channel(
+    chat_id,
+    channel_username=None,
+    channel_title=None
+):
+
+    require_database()
+
+    existing = force_channels.find_one({
+        "chat_id": int(chat_id)
+    })
+
+    if existing:
+        return existing
+
     next_id = counters.find_one_and_update(
         {"_id": "force_channels"},
-        {"$inc": {"value": 1}},
+        {
+            "$inc": {
+                "value": 1
+            }
+        },
         upsert=True,
         return_document=ReturnDocument.AFTER
     )
@@ -344,38 +667,68 @@ def add_force_channel(chat_id, channel_username=None, channel_title=None):
     }
 
     try:
+
         force_channels.insert_one(document)
+
         return document
+
     except DuplicateKeyError:
-        return force_channels.find_one({"chat_id": int(chat_id)})
+
+        return force_channels.find_one({
+            "chat_id": int(chat_id)
+        })
 
 
 def get_force_channels():
-    return list(force_channels.find().sort("id", DESCENDING))
+
+    require_database()
+
+    return list(
+        force_channels.find()
+        .sort("id", DESCENDING)
+    )
 
 
 def remove_force_channel(channel_id):
+
+    require_database()
+
     return force_channels.delete_one({
         "id": int(channel_id)
     }).deleted_count > 0
 
 
-# ---------------- ADMIN STATISTICS ----------------
+# ==========================================
+# ADMIN STATISTICS
+# ==========================================
 
 def get_statistics():
+
+    require_database()
+
     total_users = users.count_documents({})
     total_files = files.count_documents({})
 
-    pipeline = [{
-        "$group": {
-            "_id": None,
-            "views": {"$sum": "$views"},
-            "downloads": {"$sum": "$downloads"},
-            "storage": {"$sum": "$file_size"}
+    pipeline = [
+        {
+            "$group": {
+                "_id": None,
+                "views": {
+                    "$sum": "$views"
+                },
+                "downloads": {
+                    "$sum": "$downloads"
+                },
+                "storage": {
+                    "$sum": "$file_size"
+                }
+            }
         }
-    }]
+    ]
 
-    result = list(files.aggregate(pipeline))
+    result = list(
+        files.aggregate(pipeline)
+    )
 
     totals = result[0] if result else {}
 
@@ -385,18 +738,22 @@ def get_statistics():
         "total_views": totals.get("views", 0),
         "total_downloads": totals.get("downloads", 0),
         "total_storage": totals.get("storage", 0),
+
         "shared_files": files.count_documents({
             "sharing_enabled": True,
             "is_public": True
         }),
+
         "disabled_files": files.count_documents({
             "sharing_enabled": False
         }),
+
         "total_channels": force_channels.count_documents({})
     }
 
 
 def get_public_statistics():
+
     stats = get_statistics()
 
     return {
@@ -407,50 +764,165 @@ def get_public_statistics():
     }
 
 
-# ---------------- WEBHOOK QUEUE ----------------
+# ==========================================
+# WEBHOOK QUEUE
+# ==========================================
 
 def save_webhook_update(update_id, payload):
+
+    require_database()
+
     try:
+
         webhook_updates.insert_one({
             "update_id": int(update_id),
             "payload": payload,
             "status": "pending",
             "attempts": 0,
-            "created_at": now()
+            "created_at": now(),
+            "next_attempt": now()
         })
+
         return True
+
     except DuplicateKeyError:
+
+        # Update already exists in the queue.
         return False
 
 
 def claim_webhook_update():
+
+    require_database()
+
+    current_time = now()
+
     return webhook_updates.find_one_and_update(
-        {"status": "pending"},
+        {
+            "status": "pending",
+            "$or": [
+                {
+                    "next_attempt": {
+                        "$lte": current_time
+                    }
+                },
+                {
+                    "next_attempt": {
+                        "$exists": False
+                    }
+                }
+            ]
+        },
         {
             "$set": {
                 "status": "processing",
-                "processing_at": now()
+                "processing_at": current_time
             },
-            "$inc": {"attempts": 1}
+            "$inc": {
+                "attempts": 1
+            }
         },
-        sort=[("created_at", 1)],
+        sort=[
+            ("created_at", 1)
+        ],
         return_document=ReturnDocument.AFTER
     )
 
 
 def complete_webhook_update(update_id):
-    webhook_updates.delete_one({
-        "update_id": int(update_id)
-    })
 
+    require_database()
 
-def retry_webhook_update(update_id, error=None):
     webhook_updates.update_one(
-        {"update_id": int(update_id)},
+        {
+            "update_id": int(update_id)
+        },
         {
             "$set": {
-                "status": "pending",
-                "last_error": str(error or "")[:1000]
+                "status": "completed",
+                "completed_at": now()
+            },
+            {
+                "$unset": {
+                    "payload": ""
+                }
             }
         }
     )
+
+
+def retry_webhook_update(update_id, error=None):
+
+    require_database()
+
+    update = webhook_updates.find_one({
+        "update_id": int(update_id)
+    })
+
+    if not update:
+        return
+
+    attempts = int(update.get("attempts", 1))
+
+    if attempts >= 5:
+
+        webhook_updates.update_one(
+            {
+                "update_id": int(update_id)
+            },
+            {
+                "$set": {
+                    "status": "failed",
+                    "last_error": str(error or "")[:1000],
+                    "failed_at": now()
+                }
+            }
+        )
+
+        logger.error(
+            "Webhook update %s moved to failed state.",
+            update_id
+        )
+
+        return
+
+    delay = min(
+        60,
+        2 ** attempts
+    )
+
+    webhook_updates.update_one(
+        {
+            "update_id": int(update_id)
+        },
+        {
+            "$set": {
+                "status": "pending",
+                "last_error": str(error or "")[:1000],
+                "next_attempt": now() + timedelta(seconds=delay)
+            }
+        }
+    )
+
+
+def get_webhook_queue_statistics():
+
+    require_database()
+
+    return {
+        "pending": webhook_updates.count_documents({
+            "status": "pending"
+        }),
+
+        "processing": webhook_updates.count_documents({
+            "status": "processing"
+        }),
+
+        "completed": webhook_updates.count_documents({
+            "status": "completed"
+        }),
+
+        "failed": webhook_updates.count_documents({
+            "status": "failed"
+        })
+    }
