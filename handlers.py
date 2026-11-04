@@ -20,11 +20,11 @@ import database as db
 
 from config import (
     ADMIN_ID,
-    BOT_USERNAME,
     FILES_PER_PAGE,
     ADMIN_FILES_PER_PAGE,
     USERS_PER_PAGE,
-    BROADCAST_DELAY
+    BROADCAST_DELAY,
+    MAX_FILE_SIZE
 )
 
 from keyboards import (
@@ -35,7 +35,6 @@ from keyboards import (
     force_join_keyboard,
     delete_confirmation_keyboard,
     admin_delete_confirmation_keyboard,
-    force_channel_keyboard,
     back_keyboard
 )
 
@@ -79,14 +78,23 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
                 parse_mode=parse_mode
             )
         except Exception:
-            logger.exception("Could not edit or send message")
+            logger.exception("Message edit failed")
+
+
+async def answer_callback(query, text=None, alert=False):
+    try:
+        await query.answer(
+            text=text,
+            show_alert=alert
+        )
+    except Exception:
+        pass
 
 
 async def send_file_to_user(bot, chat_id, file):
     file_id = file["file_id"]
+    file_type = file["file_type"]
     caption = file.get("caption") or ""
-
-    file_type = file.get("file_type")
 
     methods = {
         "document": bot.send_document,
@@ -101,38 +109,34 @@ async def send_file_to_user(bot, chat_id, file):
 
     method = methods.get(file_type)
 
-    if not method:
+    if method is None:
         raise ValueError("Unsupported file type")
 
-    if file_type in ("sticker", "video_note"):
-        return await method(
-            chat_id=chat_id,
-            **{
-                "sticker" if file_type == "sticker"
-                else "video_note": file_id
-            }
-        )
+    argument_names = {
+        "document": "document",
+        "video": "video",
+        "photo": "photo",
+        "audio": "audio",
+        "voice": "voice",
+        "video_note": "video_note",
+        "animation": "animation",
+        "sticker": "sticker"
+    }
 
-    return await method(
-        chat_id=chat_id,
-        **{
-            {
-                "document": "document",
-                "video": "video",
-                "photo": "photo",
-                "audio": "audio",
-                "voice": "voice",
-                "animation": "animation"
-            }[file_type]: file_id
-        },
-        caption=caption[:1024] if caption else None
-    )
+    kwargs = {
+        "chat_id": chat_id,
+        argument_names[file_type]: file_id
+    }
+
+    if file_type not in ("sticker", "video_note"):
+        if caption:
+            kwargs["caption"] = caption[:1024]
+
+    return await method(**kwargs)
 
 
 async def check_force_join(user_id, context):
-    enabled = db.get_setting("force_join_enabled", False)
-
-    if not enabled:
+    if not db.get_setting("force_join_enabled", False):
         return True
 
     channels = db.get_force_channels()
@@ -156,10 +160,9 @@ async def check_force_join(user_id, context):
                 return False
 
         except Exception:
-            logger.warning(
-                "Force join check failed for channel %s",
-                chat_id,
-                exc_info=True
+            logger.exception(
+                "Force join check failed for %s",
+                chat_id
             )
             return False
 
@@ -171,8 +174,7 @@ async def show_force_join(update, context):
 
     text = (
         "🔐 <b>Channel Subscription Required</b>\n\n"
-        "Please join the required channel(s), "
-        "then press Verify Joined."
+        "Join all required channels and press Verify Joined."
     )
 
     if update.callback_query:
@@ -191,8 +193,6 @@ async def show_force_join(update, context):
 
 
 async def send_main_menu(update, context):
-    user = update.effective_user
-
     text = (
         "☁️ <b>WELCOME TO DESI CLOUD</b>\n\n"
         "Your personal Telegram cloud storage.\n\n"
@@ -218,7 +218,7 @@ async def send_main_menu(update, context):
 
 
 # ==========================================
-# START COMMAND
+# START
 # ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -226,24 +226,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.register_user(user)
 
-    # Handle shared file deep links.
-    token = extract_start_token(update.effective_message.text)
+    token = extract_start_token(
+        update.effective_message.text
+    )
+
+    if not await check_force_join(user.id, context):
+        if token:
+            context.user_data["pending_token"] = token
+
+        await show_force_join(update, context)
+        return
 
     if token:
-        if not await check_force_join(user.id, context):
-            await show_force_join(update, context)
-            context.user_data["pending_token"] = token
-            return
-
         await deliver_shared_file(
-            update,
+            update.effective_chat.id,
             context,
             token
         )
-        return
-
-    if not await check_force_join(user.id, context):
-        await show_force_join(update, context)
         return
 
     custom_message = db.get_setting(
@@ -251,13 +250,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome to DESI CLOUD!"
     )
 
+    text = escape_html(custom_message)
+
     if is_admin(user.id):
-        text = (
-            f"{escape_html(custom_message)}\n\n"
-            "👑 <b>Administrator Access</b>"
-        )
-    else:
-        text = escape_html(custom_message)
+        text += "\n\n👑 <b>Administrator Access</b>"
 
     await update.effective_message.reply_text(
         text,
@@ -270,19 +266,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SHARED FILE DELIVERY
 # ==========================================
 
-async def deliver_shared_file(update, context, token):
-    user_id = update.effective_user.id
-
+async def deliver_shared_file(chat_id, context, token):
     file = db.get_file_by_token(token)
 
     if not file:
-        await update.effective_message.reply_text(
-            "❌ This file does not exist or has been deleted."
+        await context.bot.send_message(
+            chat_id,
+            "❌ File not found or deleted."
         )
         return
 
     if not file.get("sharing_enabled") or not file.get("is_public"):
-        await update.effective_message.reply_text(
+        await context.bot.send_message(
+            chat_id,
             "🔒 This sharing link is disabled."
         )
         return
@@ -290,7 +286,7 @@ async def deliver_shared_file(update, context, token):
     try:
         await send_file_to_user(
             context.bot,
-            update.effective_chat.id,
+            chat_id,
             file
         )
 
@@ -300,7 +296,8 @@ async def deliver_shared_file(update, context, token):
     except Exception:
         logger.exception("Shared file delivery failed")
 
-        await update.effective_message.reply_text(
+        await context.bot.send_message(
+            chat_id,
             "❌ Unable to send this file right now."
         )
 
@@ -336,7 +333,7 @@ async def about_command(update, context):
 
 
 # ==========================================
-# FILE UPLOAD
+# UPLOAD
 # ==========================================
 
 async def upload_command(update, context):
@@ -351,9 +348,8 @@ async def upload_command(update, context):
 
     await update.effective_message.reply_text(
         "📤 <b>Upload File</b>\n\n"
-        "Send the document, photo, video, audio or supported media.\n\n"
-        "Maximum file size: "
-        f"<b>{format_size(__import__('config').MAX_FILE_SIZE)}</b>",
+        "Send your document, photo, video or supported media.\n"
+        f"Maximum size: <b>{format_size(MAX_FILE_SIZE)}</b>",
         parse_mode="HTML"
     )
 
@@ -365,17 +361,20 @@ async def upload_file(update, context):
     file_data = identify_file(message)
 
     if not file_data:
-        return False
+        await message.reply_text(
+            "❌ Please send a supported file."
+        )
+        return
 
     if file_data.get("error") == "FILE_TOO_LARGE":
         await message.reply_text(
-            "❌ File exceeds the configured upload size limit."
+            "❌ File exceeds the configured size limit."
         )
-        return True
-
-    token = generate_file_token()
+        return
 
     try:
+        token = generate_file_token()
+
         saved = db.save_file(
             token=token,
             file_id=file_data["file_id"],
@@ -393,19 +392,17 @@ async def upload_file(update, context):
             "✅ <b>File uploaded successfully!</b>\n\n"
             f"📁 Name: {escape_html(saved['file_name'])}\n"
             f"📦 Size: {format_size(saved['file_size'])}\n"
-            f"🆔 File ID: <code>{saved['id']}</code>",
+            f"🆔 ID: <code>{saved['id']}</code>",
             reply_markup=file_keyboard(saved["id"]),
             parse_mode="HTML"
         )
 
     except Exception:
-        logger.exception("File upload database operation failed")
+        logger.exception("File upload failed")
 
         await message.reply_text(
-            "❌ Upload could not be saved. Please try again."
+            "❌ Upload failed. Please check the database connection."
         )
-
-    return True
 
 
 # ==========================================
@@ -413,15 +410,12 @@ async def upload_file(update, context):
 # ==========================================
 
 async def show_my_files(query, user_id, page=0):
-    page = max(0, int(page))
-
     total = db.count_user_files(user_id)
 
     if total == 0:
         await safe_edit(
             query,
-            "📁 <b>My Files</b>\n\n"
-            "You haven't uploaded any files yet.",
+            "📁 <b>MY FILES</b>\n\nNo files uploaded yet.",
             main_keyboard(),
             "HTML"
         )
@@ -434,44 +428,40 @@ async def show_my_files(query, user_id, page=0):
     )
 
     lines = [
-        "📁 <b>MY CLOUD FILES</b>\n",
-        f"Total files: <b>{total}</b>\n"
+        "📁 <b>MY CLOUD FILES</b>",
+        f"Total files: <b>{total}</b>"
     ]
 
     buttons = []
 
     for file in files_list:
         file_id = file["id"]
-        name = escape_html(file["file_name"])
 
         lines.append(
-            f"📄 <b>{name}</b>\n"
-            f"   ID: <code>{file_id}</code> | "
+            f"\n📄 <b>{escape_html(file['file_name'])}</b>\n"
+            f"ID: <code>{file_id}</code> | "
             f"{format_size(file.get('file_size', 0))}"
         )
 
         buttons.append([
             InlineKeyboardButton(
-                f"📂 {file['file_name'][:35]}",
+                f"📂 {file['file_name'][:30]}",
                 callback_data=f"file:details:{file_id}"
             )
         ])
 
-    has_previous = page > 0
-    has_next = (page + 1) * FILES_PER_PAGE < total
-
     navigation = pagination_keyboard(
         "myfiles",
         page,
-        has_previous,
-        has_next
+        page > 0,
+        (page + 1) * FILES_PER_PAGE < total
     )
 
     buttons.extend(navigation.inline_keyboard)
 
     await safe_edit(
         query,
-        "\n\n".join(lines),
+        "\n".join(lines),
         InlineKeyboardMarkup(buttons),
         "HTML"
     )
@@ -481,9 +471,10 @@ async def show_file_details(query, file_id, user_id):
     file = db.get_user_file(file_id, user_id)
 
     if not file:
-        await query.answer(
+        await answer_callback(
+            query,
             "File not found.",
-            show_alert=True
+            True
         )
         return
 
@@ -513,11 +504,9 @@ async def show_file_details(query, file_id, user_id):
 # ==========================================
 
 async def generate_link_command(update, context):
-    context.user_data["state"] = "generate"
-
     await update.effective_message.reply_text(
         "🔗 <b>Generate Sharing Link</b>\n\n"
-        "Choose a file from My Files to generate its link.",
+        "Choose a file from My Files.",
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
@@ -534,36 +523,30 @@ async def generate_file_link(query, file_id, user_id):
     file = db.get_user_file(file_id, user_id)
 
     if not file:
-        await query.answer(
-            "File not found.",
-            show_alert=True
-        )
+        await answer_callback(query, "File not found.", True)
         return
 
     if not file.get("sharing_enabled"):
-        await query.answer(
-            "Sharing is disabled for this file.",
-            show_alert=True
+        await answer_callback(
+            query,
+            "Enable sharing first.",
+            True
         )
         return
 
-    db.set_file_sharing(file_id, user_id, True)
-
-    token = file["token"]
-
-    bot_link = generate_share_link(token)
-    website_link = generate_website_link(token)
+    bot_link = generate_share_link(file["token"])
+    website_link = generate_website_link(file["token"])
 
     text = (
         "🔗 <b>YOUR FILE LINK</b>\n\n"
         f"📄 {escape_html(file['file_name'])}\n\n"
-        f"🤖 Telegram Link:\n<code>{bot_link}</code>\n"
+        f"🤖 Telegram Link:\n<code>{escape_html(bot_link)}</code>"
     )
 
     if website_link:
         text += (
-            f"\n🌐 Website Link:\n"
-            f"<code>{website_link}</code>\n"
+            f"\n\n🌐 Website Link:\n"
+            f"<code>{escape_html(website_link)}</code>"
         )
 
     await safe_edit(
@@ -592,24 +575,25 @@ async def generate_file_link(query, file_id, user_id):
 # ==========================================
 
 async def handle_file_callback(query, parts, user_id, context):
+    if len(parts) < 3:
+        await answer_callback(query, "Invalid action.", True)
+        return
+
     action = parts[1]
     file_id = int(parts[2])
 
     file = db.get_user_file(file_id, user_id)
 
     if not file:
-        await query.answer(
+        await answer_callback(
+            query,
             "File not found or access denied.",
-            show_alert=True
+            True
         )
         return
 
     if action == "details":
-        await show_file_details(
-            query,
-            file_id,
-            user_id
-        )
+        await show_file_details(query, file_id, user_id)
 
     elif action == "get":
         try:
@@ -620,22 +604,14 @@ async def handle_file_callback(query, parts, user_id, context):
             )
 
             db.increment_file_downloads(file_id)
-
-            await query.answer("File sent.")
+            await answer_callback(query, "File sent.")
 
         except Exception:
-            logger.exception("File retrieval failed")
-            await query.answer(
-                "Unable to send file.",
-                show_alert=True
-            )
+            logger.exception("Get file failed")
+            await answer_callback(query, "Unable to send file.", True)
 
     elif action == "share":
-        await generate_file_link(
-            query,
-            file_id,
-            user_id
-        )
+        await generate_file_link(query, file_id, user_id)
 
     elif action == "sharing":
         enabled = not file.get("sharing_enabled", False)
@@ -646,15 +622,12 @@ async def handle_file_callback(query, parts, user_id, context):
             enabled
         )
 
-        await query.answer(
+        await answer_callback(
+            query,
             "Sharing enabled." if enabled else "Sharing disabled."
         )
 
-        await show_file_details(
-            query,
-            file_id,
-            user_id
-        )
+        await show_file_details(query, file_id, user_id)
 
     elif action == "rename":
         context.user_data["state"] = "rename"
@@ -662,8 +635,7 @@ async def handle_file_callback(query, parts, user_id, context):
 
         await safe_edit(
             query,
-            "✏️ <b>Rename File</b>\n\n"
-            "Send the new file name.",
+            "✏️ <b>Rename File</b>\n\nSend the new file name.",
             None,
             "HTML"
         )
@@ -683,33 +655,23 @@ async def handle_file_callback(query, parts, user_id, context):
                 main_keyboard()
             )
         else:
-            await query.answer(
-                "Could not delete file.",
-                show_alert=True
-            )
+            await answer_callback(query, "Delete failed.", True)
 
     elif action == "canceldelete":
-        await show_file_details(
-            query,
-            file_id,
-            user_id
-        )
+        await show_file_details(query, file_id, user_id)
 
 
 # ==========================================
-# ADMIN DASHBOARD
+# ADMIN
 # ==========================================
 
 async def admin_command(update, context):
     if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ Access denied."
-        )
+        await update.effective_message.reply_text("⛔ Access denied.")
         return
 
     await update.effective_message.reply_text(
-        "👑 <b>DESI CLOUD ADMIN PANEL</b>\n\n"
-        "Select an administration option.",
+        "👑 <b>DESI CLOUD ADMIN PANEL</b>",
         reply_markup=admin_keyboard(),
         parse_mode="HTML"
     )
@@ -727,7 +689,7 @@ async def show_admin_statistics(query):
         f"💾 Storage: <b>{format_size(stats['total_storage'])}</b>\n"
         f"🔗 Shared Files: <b>{stats['shared_files']}</b>\n"
         f"🔒 Disabled Files: <b>{stats['disabled_files']}</b>\n"
-        f"📢 Force Join Channels: <b>{stats['total_channels']}</b>"
+        f"📢 Channels: <b>{stats['total_channels']}</b>"
     )
 
     await safe_edit(
@@ -739,8 +701,6 @@ async def show_admin_statistics(query):
 
 
 async def show_admin_files(query, page=0):
-    page = max(0, int(page))
-
     total = db.count_all_files()
 
     if total == 0:
@@ -756,20 +716,15 @@ async def show_admin_files(query, page=0):
         ADMIN_FILES_PER_PAGE
     )
 
+    lines = ["📁 <b>ALL CLOUD FILES</b>", f"Total: <b>{total}</b>"]
     buttons = []
-
-    lines = [
-        "📁 <b>ALL CLOUD FILES</b>\n",
-        f"Total: <b>{total}</b>\n"
-    ]
 
     for file in files_list:
         file_id = file["id"]
 
         lines.append(
-            f"📄 {escape_html(file['file_name'])}\n"
-            f"ID: <code>{file_id}</code> | "
-            f"Owner: <code>{file['uploaded_by']}</code>"
+            f"\n📄 {escape_html(file['file_name'])}\n"
+            f"ID: <code>{file_id}</code>"
         )
 
         buttons.append([
@@ -797,15 +752,13 @@ async def show_admin_files(query, page=0):
 
     await safe_edit(
         query,
-        "\n\n".join(lines),
+        "\n".join(lines),
         InlineKeyboardMarkup(buttons),
         "HTML"
     )
 
 
 async def show_admin_users(query, page=0):
-    page = max(0, int(page))
-
     total = db.count_users()
 
     user_list = db.get_users_paginated(
@@ -814,13 +767,13 @@ async def show_admin_users(query, page=0):
     )
 
     lines = [
-        "👥 <b>REGISTERED USERS</b>\n",
-        f"Total users: <b>{total}</b>\n"
+        "👥 <b>REGISTERED USERS</b>",
+        f"Total users: <b>{total}</b>"
     ]
 
     for user in user_list:
         lines.append(
-            f"👤 {escape_html(user.get('first_name', 'Unknown'))}\n"
+            f"\n👤 {escape_html(user.get('first_name', 'Unknown'))}\n"
             f"ID: <code>{user['telegram_id']}</code>"
         )
 
@@ -833,14 +786,14 @@ async def show_admin_users(query, page=0):
 
     await safe_edit(
         query,
-        "\n\n".join(lines),
+        "\n".join(lines),
         navigation,
         "HTML"
     )
 
 
 # ==========================================
-# ADMIN FORCE JOIN
+# FORCE JOIN ADMIN
 # ==========================================
 
 async def show_force_channels_admin(query):
@@ -854,8 +807,7 @@ async def show_force_channels_admin(query):
     text = (
         "🔐 <b>FORCE JOIN SETTINGS</b>\n\n"
         f"Status: <b>{'Enabled' if enabled else 'Disabled'}</b>\n"
-        f"Channels: <b>{len(channels)}</b>\n\n"
-        "Manage required channels below."
+        f"Channels: <b>{len(channels)}</b>"
     )
 
     buttons = []
@@ -863,7 +815,7 @@ async def show_force_channels_admin(query):
     for channel in channels:
         buttons.append([
             InlineKeyboardButton(
-                f"🗑 {channel.get('channel_title') or channel.get('channel')}",
+                f"🗑 {channel.get('channel_title') or channel.get('channel_username')}",
                 callback_data=f"admin:removeforce:{channel['id']}"
             )
         ])
@@ -897,18 +849,9 @@ async def show_force_channels_admin(query):
     )
 
 
-# ==========================================
-# ADMIN CALLBACK ROUTER
-# ==========================================
-
 async def handle_admin_callback(query, context, parts):
-    user_id = query.from_user.id
-
-    if not is_admin(user_id):
-        await query.answer(
-            "Access denied.",
-            show_alert=True
-        )
+    if not is_admin(query.from_user.id):
+        await answer_callback(query, "Access denied.", True)
         return
 
     action = parts[1]
@@ -955,25 +898,14 @@ async def handle_admin_callback(query, context, parts):
                 back_keyboard("admin:files:0")
             )
         else:
-            await query.answer(
-                "File not found.",
-                show_alert=True
-            )
+            await answer_callback(query, "File not found.", True)
 
     elif action == "force":
         await show_force_channels_admin(query)
 
     elif action == "toggleforce":
-        enabled = db.get_setting(
-            "force_join_enabled",
-            False
-        )
-
-        db.set_setting(
-            "force_join_enabled",
-            not enabled
-        )
-
+        enabled = db.get_setting("force_join_enabled", False)
+        db.set_setting("force_join_enabled", not enabled)
         await show_force_channels_admin(query)
 
     elif action == "addforce":
@@ -981,8 +913,7 @@ async def handle_admin_callback(query, context, parts):
 
         await safe_edit(
             query,
-            "➕ <b>Add Force Join Channel</b>\n\n"
-            "Send the public channel username.\n"
+            "➕ <b>Send public channel username.</b>\n"
             "Example: <code>@YourChannel</code>",
             None,
             "HTML"
@@ -991,13 +922,7 @@ async def handle_admin_callback(query, context, parts):
     elif action == "removeforce":
         channel_id = int(parts[2])
 
-        if db.remove_force_channel(channel_id):
-            await query.answer("Channel removed.")
-        else:
-            await query.answer(
-                "Channel not found.",
-                show_alert=True
-            )
+        db.remove_force_channel(channel_id)
 
         await show_force_channels_admin(query)
 
@@ -1006,8 +931,7 @@ async def handle_admin_callback(query, context, parts):
 
         await safe_edit(
             query,
-            "📤 Send the file you want to upload.",
-            None
+            "📤 Send the file you want to upload."
         )
 
     elif action == "broadcast":
@@ -1015,8 +939,7 @@ async def handle_admin_callback(query, context, parts):
 
         await safe_edit(
             query,
-            "📢 <b>Broadcast Message</b>\n\n"
-            "Send the message you want to broadcast.\n"
+            "📢 <b>Send the message to broadcast.</b>\n"
             "Send /cancel to cancel.",
             None,
             "HTML"
@@ -1027,9 +950,7 @@ async def handle_admin_callback(query, context, parts):
 
         await safe_edit(
             query,
-            "⚙️ Send the new start message.\n"
-            "Send /cancel to cancel.",
-            None
+            "Send the new start message."
         )
 
     elif action == "starmsg":
@@ -1037,9 +958,7 @@ async def handle_admin_callback(query, context, parts):
 
         await safe_edit(
             query,
-            "⭐ Send the new star message.\n"
-            "Send /cancel to cancel.",
-            None
+            "Send the new star message."
         )
 
     elif action == "settings":
@@ -1074,24 +993,17 @@ async def handle_admin_callback(query, context, parts):
 
     elif action == "togglewebsite":
         enabled = db.get_setting("website_enabled", True)
-
         db.set_setting("website_enabled", not enabled)
-
-        await query.answer(
-            "Website setting updated."
-        )
-
-        website = db.get_setting("website_enabled", True)
 
         await safe_edit(
             query,
-            f"🌐 Website: {'Enabled' if website else 'Disabled'}",
+            f"🌐 Website: {'Disabled' if enabled else 'Enabled'}",
             back_keyboard("admin:settings")
         )
 
 
 # ==========================================
-# VERIFY FORCE JOIN
+# VERIFY JOIN
 # ==========================================
 
 async def verify_join(query, context):
@@ -1099,9 +1011,7 @@ async def verify_join(query, context):
         query.from_user.id,
         context
     ):
-        await query.answer(
-            "Verification successful!"
-        )
+        await answer_callback(query, "Verification successful!")
 
         token = context.user_data.pop(
             "pending_token",
@@ -1110,23 +1020,23 @@ async def verify_join(query, context):
 
         if token:
             await deliver_shared_file(
-                query,
+                query.message.chat_id,
                 context,
                 token
             )
         else:
             await safe_edit(
                 query,
-                "✅ <b>Verification successful!</b>\n\n"
-                "Welcome to DESI CLOUD.",
+                "✅ <b>Verification successful!</b>",
                 main_keyboard(),
                 "HTML"
             )
 
     else:
-        await query.answer(
+        await answer_callback(
+            query,
             "Please join all required channels first.",
-            show_alert=True
+            True
         )
 
 
@@ -1153,7 +1063,6 @@ async def perform_broadcast(message, context):
                 from_chat_id=message.chat_id,
                 message_id=message.message_id
             )
-
             success += 1
 
         except Exception:
@@ -1170,52 +1079,47 @@ async def perform_broadcast(message, context):
 
 
 # ==========================================
-# TEXT / MEDIA STATE ROUTER
+# MESSAGE ROUTER
 # ==========================================
 
 async def handle_user_message(update, context):
     message = update.effective_message
     user = update.effective_user
 
+    if not message or not user:
+        return
+
     db.register_user(user)
 
     state = context.user_data.get("state")
 
     if state == "upload":
+        if not await check_force_join(user.id, context):
+            await show_force_join(update, context)
+            return
+
         await upload_file(update, context)
         return
 
     if state == "rename":
         file_id = context.user_data.get("rename_file_id")
-
         new_name = (message.text or "").strip()
 
         if not new_name:
-            await message.reply_text(
-                "Please send a valid file name."
-            )
+            await message.reply_text("Send a valid file name.")
             return
 
         if len(new_name) > 150:
-            await message.reply_text(
-                "File name is too long. Maximum 150 characters."
-            )
+            await message.reply_text("Maximum name length is 150 characters.")
             return
 
-        if db.rename_file(
-            file_id,
-            user.id,
-            new_name
-        ):
-            context.user_data.clear()
+        if db.rename_file(file_id, user.id, new_name):
+            context.user_data.pop("state", None)
+            context.user_data.pop("rename_file_id", None)
 
-            await message.reply_text(
-                "✅ File renamed successfully."
-            )
+            await message.reply_text("✅ File renamed successfully.")
         else:
-            await message.reply_text(
-                "❌ Could not rename this file."
-            )
+            await message.reply_text("❌ Rename failed.")
 
         return
 
@@ -1223,10 +1127,7 @@ async def handle_user_message(update, context):
         channel = (message.text or "").strip()
 
         if not is_valid_channel(channel):
-            await message.reply_text(
-                "❌ Invalid channel username.\n"
-                "Example: @YourChannel"
-            )
+            await message.reply_text("Invalid channel. Example: @YourChannel")
             return
 
         try:
@@ -1240,16 +1141,12 @@ async def handle_user_message(update, context):
 
             context.user_data.pop("state", None)
 
-            await message.reply_text(
-                "✅ Force join channel added."
-            )
+            await message.reply_text("✅ Force join channel added.")
 
         except Exception:
-            logger.exception("Could not add force join channel")
-
+            logger.exception("Force channel add failed")
             await message.reply_text(
-                "❌ Could not access this channel.\n"
-                "Make sure the bot is an administrator there."
+                "❌ Could not access channel. Add bot as administrator first."
             )
 
         return
@@ -1261,10 +1158,7 @@ async def handle_user_message(update, context):
         )
 
         context.user_data.pop("state", None)
-
-        await message.reply_text(
-            "✅ Start message updated."
-        )
+        await message.reply_text("✅ Start message updated.")
         return
 
     if state == "star_message" and is_admin(user.id):
@@ -1274,30 +1168,24 @@ async def handle_user_message(update, context):
         )
 
         context.user_data.pop("state", None)
-
-        await message.reply_text(
-            "✅ Star message updated."
-        )
+        await message.reply_text("✅ Star message updated.")
         return
 
     if state == "broadcast" and is_admin(user.id):
         if message.text and message.text.startswith("/"):
-            await message.reply_text(
-                "Broadcast cancelled."
-            )
+            await message.reply_text("Broadcast cancelled.")
             context.user_data.pop("state", None)
             return
 
         context.user_data.pop("state", None)
-
-        await perform_broadcast(
-            message,
-            context
-        )
+        await perform_broadcast(message, context)
         return
 
-    # Allow automatic file upload without pressing Upload.
     if identify_file(message):
+        if not await check_force_join(user.id, context):
+            await show_force_join(update, context)
+            return
+
         await upload_file(update, context)
         return
 
@@ -1332,14 +1220,14 @@ async def callback_router(update, context):
         return
 
     data = query.data or ""
-
     parts = data.split(":")
-
     user_id = query.from_user.id
 
     try:
+        # Answer callback once before processing.
+        await answer_callback(query)
+
         if data == "home":
-            await query.answer()
             await send_main_menu(update, context)
             return
 
@@ -1348,7 +1236,6 @@ async def callback_router(update, context):
             return
 
         if data == "upload":
-            await query.answer()
             context.user_data["state"] = "upload"
 
             await safe_edit(
@@ -1358,7 +1245,6 @@ async def callback_router(update, context):
             return
 
         if data == "generate":
-            await query.answer()
             await safe_edit(
                 query,
                 "🔗 Select a file from My Files.",
@@ -1374,8 +1260,6 @@ async def callback_router(update, context):
             return
 
         if data == "about":
-            await query.answer()
-
             await safe_edit(
                 query,
                 escape_html(
@@ -1387,8 +1271,6 @@ async def callback_router(update, context):
             return
 
         if data == "help":
-            await query.answer()
-
             await safe_edit(
                 query,
                 escape_html(
@@ -1400,17 +1282,10 @@ async def callback_router(update, context):
             return
 
         if data == "star":
-            await query.answer()
-
-            star_message = db.get_setting(
-                "star_message",
-                ""
-            )
-
             await safe_edit(
                 query,
                 escape_html(
-                    star_message or "⭐ Thank you for using DESI CLOUD!"
+                    db.get_setting("star_message", "")
                 ),
                 back_keyboard(),
                 "HTML"
@@ -1418,8 +1293,6 @@ async def callback_router(update, context):
             return
 
         if data.startswith("myfiles:"):
-            await query.answer()
-
             page = int(parts[1])
 
             await show_my_files(
@@ -1430,8 +1303,6 @@ async def callback_router(update, context):
             return
 
         if parts[0] == "file":
-            await query.answer()
-
             await handle_file_callback(
                 query,
                 parts,
@@ -1441,8 +1312,6 @@ async def callback_router(update, context):
             return
 
         if parts[0] == "admin":
-            await query.answer()
-
             await handle_admin_callback(
                 query,
                 context,
@@ -1450,21 +1319,17 @@ async def callback_router(update, context):
             )
             return
 
-        await query.answer()
-
     except Exception:
         logger.exception(
-            "Callback handling error: %s",
+            "Callback error: %s",
             data
         )
 
-        try:
-            await query.answer(
-                "Something went wrong.",
-                show_alert=True
-            )
-        except Exception:
-            pass
+        await answer_callback(
+            query,
+            "Something went wrong. Check Render logs.",
+            True
+        )
 
 
 # ==========================================
@@ -1512,4 +1377,4 @@ def register_handlers(application: Application):
         )
     )
 
-    logger.info("Telegram handlers registered.")
+    logger.info("DESI CLOUD handlers registered successfully.")
